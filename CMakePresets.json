@@ -6,6 +6,11 @@
             "displayName": "macOS arm64 + vcpkg",
             "generator": "Ninja",
             "binaryDir": "build",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            },
             "cacheVariables": {
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "arm64-osx",
@@ -18,6 +23,11 @@
             "displayName": "macOS arm64 + vcpkg debug",
             "generator": "Ninja",
             "binaryDir": "build_debug",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            },
             "cacheVariables": {
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "arm64-osx",
@@ -30,6 +40,11 @@
             "displayName": "macOS arm64 + vcpkg thread sanitizer",
             "generator": "Ninja",
             "binaryDir": "build_tsan",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            },
             "cacheVariables": {
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "arm64-osx",
@@ -43,12 +58,57 @@
             "displayName": "macOS arm64 + vcpkg address/UB sanitizer",
             "generator": "Ninja",
             "binaryDir": "build_asan",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            },
             "cacheVariables": {
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "arm64-osx",
                 "CMAKE_CXX_STANDARD": "20",
                 "CMAKE_BUILD_TYPE": "Debug",
                 "SANITIZER": "address"
+            }
+        },
+        {
+            "name": "vcpkg-x64-windows",
+            "displayName": "Windows x64 + vcpkg (clang-cl)",
+            "generator": "Ninja",
+            "binaryDir": "build",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            },
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_CXX_STANDARD": "20",
+                "CMAKE_BUILD_TYPE": "Release"
+            }
+        },
+        {
+            "name": "vcpkg-x64-windows-debug",
+            "displayName": "Windows x64 + vcpkg (clang-cl) debug",
+            "generator": "Ninja",
+            "binaryDir": "build_debug",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            },
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_CXX_STANDARD": "20",
+                "CMAKE_BUILD_TYPE": "Debug"
             }
         }
     ],
@@ -71,6 +131,16 @@
         {
             "name": "vcpkg-arm64-asan",
             "configurePreset": "vcpkg-arm64-asan",
+            "jobs": 0
+        },
+        {
+            "name": "vcpkg-x64-windows",
+            "configurePreset": "vcpkg-x64-windows",
+            "jobs": 0
+        },
+        {
+            "name": "vcpkg-x64-windows-debug",
+            "configurePreset": "vcpkg-x64-windows-debug",
             "jobs": 0
         }
     ]

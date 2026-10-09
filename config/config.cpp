@@ -1,6 +1,8 @@
 #include "config/config.h"
 
+#ifndef _WIN32
 #include <sys/stat.h>
+#endif
 
 #include <charconv>
 #include <cstdio>
@@ -110,6 +112,17 @@ std::optional<std::string> ReadFile(const std::string& path) {
 // A secrets file other users on the box can read defeats the point of keeping
 // the token out of argv. Warned about, not rejected: a 644 .env on a dev
 // laptop is normal, and refusing to start over it would be the wrong trade.
+//
+// WINDOWS: this check does not exist there. The UCRT ships <sys/stat.h> but
+// not S_IRGRP/S_IROTH, and POSIX mode bits do not describe a Windows ACL
+// anyway - st_mode would report a value that means nothing. So a
+// world-readable .env goes UNWARNED on Windows. That is a real behaviour
+// difference, not just a build fix: the equivalent check would have to ask
+// the ACL whether Everyone/Users holds FILE_READ_DATA, which the MVP does
+// not do.
+#ifdef _WIN32
+void WarnIfWorldReadable(const std::string&) {}
+#else
 void WarnIfWorldReadable(const std::string& path) {
     struct stat st{};
     if (::stat(path.c_str(), &st) != 0) {
@@ -120,6 +133,7 @@ void WarnIfWorldReadable(const std::string& path) {
                      static_cast<unsigned>(st.st_mode & 07777));
     }
 }
+#endif
 
 }  // namespace
 

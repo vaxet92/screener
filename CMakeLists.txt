@@ -26,7 +26,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # that is declared and never fed.
 #
 # Set before any add_subdirectory so the flags reach every target.
-add_compile_options(-Wall -Wextra -Werror)
+# The flags are compiler-family specific. MSVC() is also true for clang-cl,
+# which takes the /-style set; /W4 /WX is the closest equivalent pair.
+#
+# /bigobj is not tuning: Beast's template instantiations in md_provider
+# exceed the COFF section limit and the compile fails outright without it.
+# /utf-8 fixes the source encoding assumption - MSVC otherwise reads the
+# non-ASCII comment bytes as the system codepage.
+#
+# NOMINMAX: windows.h defines min/max as macros, which breaks std::min
+# inside Asio's headers. WIN32_LEAN_AND_MEAN keeps winsock.h out, which
+# would clash with the winsock2.h Asio includes itself.
+if(MSVC)
+    add_compile_options(/W4 /WX /permissive- /utf-8 /bigobj)
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+else()
+    add_compile_options(-Wall -Wextra -Werror)
+endif()
 
 option(BUILD_TESTS "Build unit tests" ON)
 option(BUILD_BENCHMARKS "Build latency micro-benchmarks" OFF)
@@ -54,10 +70,27 @@ option(BUILD_BENCHMARKS "Build latency micro-benchmarks" OFF)
 set(SANITIZER "none" CACHE STRING "Sanitizer: none | address | thread")
 set_property(CACHE SANITIZER PROPERTY STRINGS none address thread)
 
+#
+# NOTE: Windows has ASan but no UBSan and no TSan, so the sanitizer story is
+# asymmetric across platforms - see the branches below. The thread case is a
+# hard error rather than a silent no-op: without it, SANITIZER=thread
+# configures cleanly on Windows and produces a build with no instrumentation
+# at all, which is worse than a failure because it looks like a pass.
 if(SANITIZER STREQUAL "address")
-    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
-    add_link_options(-fsanitize=address,undefined)
+    if(MSVC)
+        # /Zi so the ASan report carries symbols. Incremental linking is
+        # incompatible with ASan, hence /INCREMENTAL:NO.
+        add_compile_options(/fsanitize=address /Zi)
+        add_link_options(/INCREMENTAL:NO)
+    else()
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+        add_link_options(-fsanitize=address,undefined)
+    endif()
 elseif(SANITIZER STREQUAL "thread")
+    if(MSVC)
+        message(FATAL_ERROR
+            "SANITIZER=thread is unavailable on MSVC/clang-cl - run the TSan preset on macOS or Linux")
+    endif()
     add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=thread)
 elseif(NOT SANITIZER STREQUAL "none")
