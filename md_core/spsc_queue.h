@@ -12,7 +12,7 @@
 #include <cstddef>
 #include <type_traits>
 
-namespace market_data {
+namespace screener {
 
 // Single-producer, single-consumer ring buffer. One producer thread calls TryPush, one consumer thread calls
 // TryPop - never the other way round, and never two threads on the same
@@ -124,4 +124,4 @@ class SpscQueue {
     alignas(64) std::array<ValueType, Capacity> buffer_{};
 };
 
-}  // namespace market_data
+}  // namespace screener

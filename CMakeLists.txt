@@ -9,9 +9,24 @@ endif()
 
 project(screener CXX)
 
+# NOTE: configuring prints a CMP0167 dev warning from
+# vcpkg_installed/.../boost/vcpkg-cmake-wrapper.cmake. It is vcpkg's wrapper
+# calling the removed FindBoost module, inside vcpkg's own policy scope -
+# setting CMP0167 here does NOT suppress it (tried). Boost still resolves
+# through BoostConfig.cmake, which is what we want. Harmless; not ours to fix.
+
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -Werror from the start, not "once it is clean". Every warning this project
+# would hit is a real defect class in it: -Wswitch catches an unhandled
+# TimeFrame or Arrival enumerator, -Wconversion-adjacent warnings catch a
+# silent narrowing of a scaled int64, and -Wunused catches an indicator field
+# that is declared and never fed.
+#
+# Set before any add_subdirectory so the flags reach every target.
+add_compile_options(-Wall -Wextra -Werror)
 
 option(BUILD_TESTS "Build unit tests" ON)
 option(BUILD_BENCHMARKS "Build latency micro-benchmarks" OFF)
@@ -29,9 +44,13 @@ option(BUILD_BENCHMARKS "Build latency micro-benchmarks" OFF)
 # NOTE: LeakSanitizer is unsupported on macOS arm64, so the address build
 # finds memory ERRORS but not leaks.
 #
-# NOTE: TSan cannot see inside uninstrumented vcpkg libraries (boost, gRPC,
+# NOTE: TSan cannot see inside uninstrumented vcpkg libraries (Boost,
 # OpenSSL), so it may report false positives from their internals. Our own
 # code is the signal; unit_tests is where that signal is cleanest.
+#
+# The MVP is single-threaded, so there is nothing of ours for TSan to find
+# yet. The thread build exists for SpscQueue, which Phase 1 needs when the
+# parse moves off the io_context thread.
 set(SANITIZER "none" CACHE STRING "Sanitizer: none | address | thread")
 set_property(CACHE SANITIZER PROPERTY STRINGS none address thread)
 

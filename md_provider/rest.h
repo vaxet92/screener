@@ -7,7 +7,7 @@
 #include <optional>
 #include <string>
 
-namespace market_data {
+namespace screener {
 
 // One-shot synchronous HTTPS GET. Returns the response body, or
 // std::nullopt on any failure (DNS, TLS, non-200 status, malformed
@@ -25,4 +25,4 @@ namespace market_data {
 // with net::post(ioc, ...).
 std::optional<std::string> HttpsGet(const std::string& host, const std::string& port, const std::string& target);
 
-}  // namespace market_data
+}  // namespace screener

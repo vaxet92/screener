@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 
-using namespace market_data;
+using namespace screener;
 
 namespace {
 

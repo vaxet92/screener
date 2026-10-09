@@ -10,7 +10,7 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/version.hpp>
 
-namespace market_data {
+namespace screener {
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -69,4 +69,4 @@ std::optional<std::string> HttpsGet(const std::string& host, const std::string& 
     }
 }
 
-}  // namespace market_data
+}  // namespace screener

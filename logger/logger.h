@@ -30,6 +30,11 @@ class Logger {
                    fmt::vformat(format.get(), fmt::make_format_args(args...)));
     }
 
+    // Raise or lower the threshold at runtime. Called once from main() for
+    // --verbose; relaxed ordering is enough because the only writer is
+    // startup, before any logging thread exists.
+    static void SetMinLevel(LogLevel level) { min_level_.store(level, std::memory_order_relaxed); }
+
    private:
     // UTC, microsecond resolution: "17:42:31.123456".
     //

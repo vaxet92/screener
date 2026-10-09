@@ -9,11 +9,16 @@
 #include <cstdint>
 #include <string_view>
 
-namespace market_data {
+namespace screener {
 
-// 10^n for n in [0, 8]. `scale` must stay in this range.
-inline constexpr uint64_t kMultipliers[] = {1ULL,       10ULL,        100ULL,        1'000ULL,      10'000ULL,
-                                            100'000ULL, 1'000'000ULL, 10'000'000ULL, 100'000'000ULL};
+// 10^n for n in [0, 10]. `scale` must stay in this range.
+//
+// Extended past 1e8 for the screener: kPriceScale is 1e10 (types/candle.h),
+// because the linear-perp universe spans ~10^10 and 1e8 would leave a
+// micro-priced contract only three significant digits.
+inline constexpr uint64_t kMultipliers[] = {
+    1ULL,         10ULL,         100ULL,         1'000ULL,         10'000ULL,        100'000ULL,
+    1'000'000ULL, 10'000'000ULL, 100'000'000ULL, 1'000'000'000ULL, 10'000'000'000ULL};
 
 // Parses a decimal string like "0.0024" into a scaled uint64_t (default 1e8,
 // matching PriceTicks/QtyUnits). No floating point: venue prices/quantities
@@ -22,7 +27,7 @@ inline constexpr uint64_t kMultipliers[] = {1ULL,       10ULL,        100ULL,   
 // beyond `scale` are truncated. `scale` must be 0..8.
 template <uint64_t Scale = 8>
 inline uint64_t ParseScaledDecimal(std::string_view sv) noexcept {
-    static_assert(Scale <= 8, "Scale must be 0..8 (index into kMultipliers)");
+    static_assert(Scale <= 10, "Scale must be 0..10 (index into kMultipliers)");
 
     uint64_t value = 0;
     size_t dot_pos = 0;
@@ -47,4 +52,4 @@ inline uint64_t ParseScaledDecimal(std::string_view sv) noexcept {
     return value;
 }
 
-}  // namespace market_data
+}  // namespace screener

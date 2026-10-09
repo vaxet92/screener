@@ -47,16 +47,19 @@ if a measurement asks for them.
 ```
 main thread, one io_context
   ControlManager::Run()                                   [control_manager/]
-    1. REST instruments-info (cursor paged) -> symbol universe -> ids
-    2. REST kline interval=60 per symbol -> CoreManager::Warmup()   [LTF ONLY, see 7]
-    3. WS connect + batched subscribe                     [md_provider/]
-    4. ioc.run():
-         WS frame -> parse -> Candle -> CoreManager::ApplyCandle()   <-- direct callback
+    1. REST instruments-info (cursor paged) -> symbol universe -> ids   [BLOCKING]
+    2. WS connect + batched subscribe                     [md_provider/]
+    3. async REST kline interval=60 per symbol -> CoreManager::Warmup()  [LTF ONLY, see 7]
+       16 in flight, paced by RateLimiter::AsyncAcquire
+    4. ioc.run() drives 2 and 3 concurrently:
+         WS frame before warm-up ends -> startup_buffer_   <-- see "Startup buffer" below
+         last warm-up response -> replay the buffer -> warmed_up_ = true
+         WS frame after that -> parse -> Candle -> CoreManager::ApplyCandle()  <-- direct callback
          20s ping timer -> send {"op":"ping"}, check pong freshness
-         after each frame -> drain pending rebuilds (blocking REST)
+         after each frame -> drain pending rebuilds (async REST)
 
   CoreManager                                             [md_core/]
-    dedup/gap by open_time -> three signal managers -> HTF aggregate
+    dedup/gap by open_time -> LTF tracker -> HTF aggregate -> HTF tracker
     -> TryActivate/TryDeactivate -> console table
 ```
 
@@ -101,19 +104,67 @@ an oversight.
 
 ### Blocking REST on the io_context thread
 
-The MVP calls REST synchronously on the only thread, which stalls WebSocket reads for the
-duration. This is acceptable, and the reason is worth being precise about:
+Only **one** REST call blocks now: `instruments-info`, in `FetchUniverse`. It runs before
+`ioc.run()` is entered, so there is no event loop to stall, and nothing could overlap with
+it anyway — ids come from its result, so neither the subscribe nor the warm-up can start
+until it returns.
 
-- **Warm-up** runs *before* the WS subscribe, so there is nothing to stall.
-- **A rebuild** is ~1 request, a few hundred ms. Inbound frames queue in the kernel and
-  Beast's buffer and are read afterwards; nothing is lost. The 20 s ping timer is also
-  delayed, which is harmless against Bybit's 10-minute idle cutoff.
-- It also *removes* a problem: no live bars are processed during a rebuild, so there is no
-  interleaving to reason about (§7).
+Everything after that is async (`md_provider/async_rest.h`), because the warm-up now
+**overlaps the live stream** and blocking the one thread would starve exactly the socket
+the overlap exists to protect. `RateLimiter` therefore has two interfaces over one window:
+`Acquire()` (blocking, startup only) and `AsyncAcquire()` (a handler posted to the
+`io_context` when a slot frees). Two separate windows would let the two paths together
+exceed the IP limit.
 
-**Known MVP limitation:** a rebuild storm — many symbols gapping at once — serialises into
-one long stall. Phase 1's fix is a separate REST thread handing results back through a
-queue, which is the same migration as the callback → SPSC one.
+**Measured** (2026-10-09, 791 symbols, 603 bars each, 16 concurrent): warm-up completes in
+**17.98 s**, ~44 req/s. The WS handshake and all 8 subscribe acks land *inside* that
+window, which is the overlap working. At 16 concurrent and 44 req/s a single request takes
+~364 ms, so the sequential equivalent would be ~288 s — the speedup is the concurrency
+factor, which means the **rate limiter is not yet the binding constraint** (its ceiling is
+60 req/s at the default 300-per-5s).
+
+**Known MVP limitation:** a rebuild storm no longer stalls the loop, but ~800 symbols
+gapping at once would still queue ~800 requests behind the limiter at 60 req/s ≈ 13 s
+before the last one is served. That is a pacing floor, not a stall — frames keep being
+read throughout.
+
+### Startup buffer
+
+A closed bar is pushed **exactly once**. If it closes while we are not yet subscribed, it
+is gone — and `Classify` only notices on that symbol's *next* bar, up to an hour later, so
+the symbol runs one bar stale in the meantime with internally consistent but lagging
+indicators. Against a 3600 s bar period an 18 s warm-up means this happens in roughly
+**0.5 % of runs**, hitting every symbol warmed before the boundary.
+
+So the subscribe comes **first** and `ControlManager::OnCandle` buffers into
+`startup_buffer_` until `warmed_up_`. `FinishWarmup` then replays it in arrival order
+through `ApplyCandle`.
+
+**The reconciliation needs no new code.** `open_time` is already a bar's only identity, so
+a buffered bar the REST history also covers is `kDuplicate`/`kStale` and is dropped, and
+one past it is `kNext` and is applied. This is the snapshot-plus-delta pattern used to
+bootstrap an order book, except that klines have no sequence number to reconcile against —
+`open_time` *is* the sequence, which is why there is no reorder buffer and no "wait for
+seq > snapshot" state machine.
+
+Sizing: at 1h bars an 18 s warm-up yields at most one bar per symbol, so ~800 candles
+(~38 KB) is the realistic worst case. `kMaxStartupBuffer = 65536` is three orders of
+magnitude of slack; overflowing it means warm-up has been running for hours, and dropping
+those bars is correct because the gap path rebuilds the affected symbols anyway.
+
+**Measured:** both live runs replayed **0** buffered candles — no hour boundary fell
+inside the 18 s window, as expected at 0.5 %. The buffer-and-replay path is therefore
+**exercised by no test and by no live run yet**, which is its main weakness: it needs
+either a ControlManager test with an injected REST source, or a run started deliberately
+~20 s before the hour.
+
+**Rejected:** keeping the old order (warm up, then subscribe) and letting the gap path
+absorb it. It does self-heal, but detection is up to an hour late and the recovery is a
+full 603-bar refetch for potentially half the universe at once.
+
+**Rejected:** a per-symbol buffer. Arrival order across symbols is irrelevant because
+symbols are independent, and within a symbol the stream is already ordered, so one flat
+vector in arrival order is sufficient and allocates once.
 
 ### Why one core thread even later
 
@@ -239,7 +290,7 @@ boundary is safe and should be explicit.
 
 ## 4. The `Candle` type and bar identity
 
-**[not implemented]** — MVP form below; the 64-byte layout is a **Phase 1** exercise
+**[done]** — `types/candle.h`. MVP form below; the 64-byte layout is a **Phase 1** exercise
 (§13), not an MVP requirement.
 
 One type serves both the queue message and the stored bar.
@@ -301,7 +352,7 @@ separately and labelled as including skew.
 
 ## 5. Timeframes and LTF → HTF aggregation
 
-**[not implemented]**
+**[done]** — `md_core/htf_aggregator.h`
 
 We subscribe to the **LTF (1h) kline only** and build the **HTF (4h)** locally.
 
@@ -344,183 +395,246 @@ byte cost.
 
 ---
 
-## 6. Per-symbol state — three signal managers
+## 6. Per-symbol state — two timeframe trackers
 
-**[not implemented]**
+**[done]** — `md_core/candle_tracker.h`, `md_core/symbol_tracker.h`, `md_core/core.{h,cpp}`
 
-Each filter condition is one class that owns its own logic and its own storage, and
-exposes exactly two operations: `Update()` and `Get()`.
+`SymbolTracker` owns one `CandleTracker` per timeframe. Each `CandleTracker` owns the
+candle history and the indicators **for its own timeframe**, and nothing else.
 
-Shown in **MVP form**: plain `std::deque` / `std::vector` history, no fixed-capacity
-containers. Swapping those for `FixedRing` is a Phase 1 exercise with a benchmark on
-either side (§13); the interfaces below do not change when it happens, which is the
-point of writing them this way first.
+### Why the decomposition is by timeframe and not by filter condition
+
+This section previously specified three *signal* managers — `VolumeSurgeManager`,
+`TrendManager`, `VolatilityManager` — one per filter condition. That was replaced after
+mapping each indicator to the timeframe that drives it:
+
+| indicator | timeframe | read by |
+|---|---|---|
+| 24-bar turnover windows | LTF 1h | surge |
+| Wilder ATR(14) → NATR | LTF 1h | volatility |
+| EMA50 | **HTF 4h** | trend |
+
+Every indicator belongs to exactly **one** timeframe. Nothing is fed by both. The
+timeframe axis is therefore the axis the *data* already has, and the per-condition axis
+was fighting it: the trend condition compares the latest **1h** close against the **4h**
+EMA50, so `TrendManager` needed both `UpdateLtf()` and `UpdateHtf()`. A class with two
+update paths keyed by timeframe is a class whose decomposition is wrong.
+
+What survives from the old shape is the half that mattered: **`Get()` returns a value,
+never a verdict.** The thresholds live in `CoreManager`, so changing one never means
+touching an indicator. The three *conditions* are now reads in `CoreManager`:
+
+- surge → `ltf.Turnover()` — two raw sums
+- trend → `ltf.LastClose()` vs `htf.GetEma()` — the only one that spans, and it spans as
+  two scalar reads
+- volatility → `ltf.GetNatrBp()`
+
+Per-timeframe decomposition also makes warm-up and rebuild one call per timeframe, which
+is exactly how §7 feeds history back in.
+
+### CandleTracker
 
 ```cpp
-// Volume surge: two adjacent 24-bar windows over LTF turnover.
-class VolumeSurgeManager {
-    std::deque<Volume> turnover_;           // MVP; FixedRing<Volume, 64> in Phase 1
-    Volume   recent_sum_ = 0, prev_sum_ = 0;
-    uint32_t bars_ = 0;
-  public:
-    void Update(const Candle& ltf);
-    struct Value { bool ready; Volume recent; Volume prev; };   // raw sums, not a ratio
-    Value Get() const;
-};
+class CandleTracker {
+   public:
+    static CandleTracker MakeLtf();   // H1: turnover window + ATR
+    static CandleTracker MakeHtf();   // H4: EMA50
 
-// Trend: EMA50 on HTF, compared against the latest LTF close.
-class TrendManager {
-    Ema<50>  ema_htf_;                      // int64 state at kPriceScale
-    Price    last_close_ltf_ = 0;
-    uint32_t htf_bars_ = 0;
-  public:
-    void UpdateLtf(const Candle&);          // records the close to compare
-    void UpdateHtf(const Candle&);          // advances EMA50
-    struct Value { bool ready; Price close; Price ema; };
-    Value Get() const;
-};
+    CandleTracker(const CandleTracker&) = delete;
+    CandleTracker& operator=(const CandleTracker&) = delete;
+    CandleTracker(CandleTracker&&) = default;
+    CandleTracker& operator=(CandleTracker&&) = default;
 
-// Volatility: Wilder ATR(14) on LTF, reported in BASIS POINTS.
-class VolatilityManager {
-    WilderAtr<14> atr_;                     // int64 state at kPriceScale
-    Price    prev_close_ = 0, last_close_ = 0;
-    uint32_t bars_ = 0;
-  public:
-    void Update(const Candle& ltf);
-    struct Value { bool ready; int32_t natr_bp; };   // 100 bp = 1.00 %
-    Value Get() const;
-};
+    void Apply(const Candle& c);
+    void Reset();
 
-struct SymbolState {
-    uint32_t id;
-    Symbol   symbol;                   // std::string: logging and the active set only
+    uint32_t Bars() const noexcept;
+    Price    LastClose() const noexcept;
 
-    VolumeSurgeManager volume_surge;
-    TrendManager       trend;
-    VolatilityManager  volatility;
+    bool  EmaReady() const noexcept;      Price   GetEma() const noexcept;
+    bool  AtrReady() const noexcept;      int32_t GetNatrBp() const noexcept;
+    TurnoverWindow<24>::Value Turnover() const noexcept;
 
-    HtfAggregator      agg;            // 4 x LTF -> 1 HTF
-    std::deque<Candle> recent_ltf;     // last N closed candles, inspection only
-    std::deque<Candle> recent_htf;
+   private:
+    enum Use : uint8_t { kEma = 1, kAtr = 2, kTurnover = 4 };
+    explicit CandleTracker(TimeFrame frame, uint8_t use);
 
-    int64_t last_ltf_open_time = 0;    // dedup / gap - state-owned, see below
-    bool    is_active = false;
+    std::optional<Ema<50>>            ema_;
+    std::optional<WilderAtr<14>>      atr_;
+    std::optional<TurnoverWindow<24>> turnover_;
+
+    std::deque<Candle> recent_;      // last 10 closed bars, inspection only
+    Price    last_close_ = 0;
+    uint32_t bar_count_ = 0;
 };
 ```
 
-`VolumeSurgeManager::Get()` returns the two **raw sums**, not their ratio: the threshold
-test is `recent * 100 > prev * 130` in `__int128` (§3), so handing back a quotient would
-mean dividing — losing exactness — only for the caller to multiply again. `natr_bp` is
-an integer for the same reason, and because basis points are directly comparable across
-symbols for the NATR rank.
+**`std::optional` members, not `std::vector<std::unique_ptr<IndicatorBase>>`.** The
+polymorphic list was tried and rejected. It gives a free `Update()` loop and then destroys
+`Get()`:
 
-### Why this decomposition
+- the trend condition needs the EMA as a typed `Price` at `kPriceScale`;
+- the volatility condition needs NATR as `int32_t` **basis points**;
+- the surge condition needs **two** sums.
 
-- **One class per condition** means each signal is independently unit-testable against a
-  naive reference, with no engine, no config and no other signal present. That is what the
-  DRILL mode wants, and it is why `SymbolState` is a plain aggregate with no logic of its
-  own.
-- **Each manager stores only what its own logic reads.** `VolumeSurgeManager` needs 48
-  turnover values, `VolatilityManager` needs one prior close, `TrendManager` needs one
-  close plus EMA state. Giving all three a full 48-candle history would triple the
-  per-symbol footprint to hold data two of them never read.
-- **`prev_close` is not a free-floating field.** Wilder's true range needs the previous
-  close, and `VolatilityManager` owns that value because it is the only consumer. The
-  candle *history* for later analysis lives once, in `recent_ltf` / `recent_htf`, and
-  **no signal depends on it** — so a change to the history depth can never alter a
-  signal.
-- **`std::deque` in the MVP, a ring later.** A deque allocates per block, which the
-  eventual no-alloc goal forbids — but that goal is Phase 1, gated on a benchmark, and
-  the MVP's job is to be correct and measurable first. When it is replaced, capacity
-  becomes a power of two so the wrap is a mask.
-- **EMA50 and Wilder ATR keep no history.** Both are recursive, so they are a few scalars
-  of state. This is also why a gap cannot be repaired by inserting the missing bar later
-  (§7).
+One `virtual double GetValue()` cannot carry any of those, and Wilder's ATR cannot even
+implement `virtual void Update(double)` — True Range needs `high`, `low` *and* the
+previous close. The three were never substitutable, so the base class forced each
+implementor to lie about its own signature. `std::optional` also costs no heap allocation
+and no vtable across 1000 symbols.
 
-### Thresholds live in CoreManager, not in the managers
+**One factory per timeframe**, built on a private `Use` bitmask constructor, so "which
+indicators does this timeframe have" is answered in exactly one place.
 
-`Get()` returns the computed *value*; it does not decide. `TryActivate` / `TryDeactivate`
-read the three values and compare them against the config thresholds:
+**`has_value()` and readiness are different questions.** `has_value()` means *this
+timeframe uses the indicator at all*; `Ready()` means *it has been fed enough bars to
+mean anything*. An EMA50 exists from construction and is meaningless for its first 49
+bars, so readiness is a bar counter, and it is `Ready()` that makes a symbol `not ready`.
+
+**Copy deleted, move defaulted.** Deleting the copy is right — duplicating recursive
+indicator state gives two trackers that silently drift apart. But declaring *any* copy
+operation suppresses the implicit **move** constructor, and without a move `SymbolTracker`
+is neither copyable nor movable, which makes `std::vector<SymbolTracker>` fail to compile
+on `Cpp17MoveInsertable`: a vector must be able to relocate its elements when it grows.
+This cost one build failure to learn.
+
+**`last_close_` is a stored member, not `recent_.back().close`.** `recent_` is empty after
+`Reset()` and before the first `Apply()` — and `Reset()` is precisely what a gap rebuild
+calls. `std::deque::back()` on an empty deque does not throw, it reads past the end, so
+the alternative is a silent garbage read rather than a crash.
+
+### SymbolTracker
+
+```cpp
+enum class Arrival { kFirst, kNext, kDuplicate, kStale, kGap };
+
+class SymbolTracker {
+   public:
+    SymbolTracker(uint32_t id, Symbol symbol);
+
+    Arrival Classify(int64_t open_time_ms) const noexcept;
+
+    // Updates the LTF tracker and, on a 4h boundary, the HTF tracker.
+    // Returns the completed HTF candle so the caller knows a boundary passed.
+    std::optional<Candle> ApplyLtf(const Candle& c);
+    void Reset();
+
+    const CandleTracker& Ltf() const noexcept;
+    const CandleTracker& Htf() const noexcept;
+
+    bool IsActive() const noexcept;        void SetActive(bool);
+    bool RebuildPending() const noexcept;  void SetRebuildPending(bool);
+
+   private:
+    uint32_t id_;
+    Symbol   symbol_;        // logging and the active set only
+    CandleTracker ltf_;      // by value: both always exist, known size
+    CandleTracker htf_;
+    HtfAggregator agg_;
+    int64_t last_ltf_open_time_ = 0;
+    bool is_active_ = false;
+    bool rebuild_pending_ = false;
+};
+```
+
+**Both trackers by value, not `unique_ptr`.** Both always exist and have known size.
+Heap-allocating them would cost 2000 allocations across the universe, an indirection on
+every bar, and make `SymbolTracker` move-only for no reason.
+
+**No `VenueId`.** One venue. **No `Symbol` inside `CandleTracker`** — it would duplicate
+what `SymbolTracker` already holds.
+
+**`SymbolTracker` does not fetch history.** `WarmUp()` doing REST from inside `md_core`
+inverts the layering: `ControlManager` owns REST (§2). This class exposes `Reset()` and
+`ApplyLtf()`, and whoever holds the history feeds it in oldest-first. One consequence is
+that warm-up and gap rebuild are the *same* code path.
+
+**No `warmup_vec_`.** §7 removed it: a bar arriving between the gap and the rebuild is
+already contained in the refetch and is dropped by the `open_time` dedup rule, so there is
+nothing left to buffer. `rebuild_pending_` is what drops those bars, and it also stops a
+second gap from queueing the same symbol twice.
+
+### Dedup state is owned by SymbolTracker, not by an indicator
+
+The indicators never see a bar the identity check rejected. If each tracked its own
+`last_open_time`, a bar could be accepted by one and rejected by another, leaving the
+symbol permanently inconsistent with no way to detect it. One owner, checked once, before
+anything is applied.
+
+### Update order, and the trap in it
 
 ```cpp
 void CoreManager::ApplyCandle(const Candle& c) {
-    SymbolState& s = state_[c.symbol_id];
+    if (c.symbol_id >= state_.size()) return;
+    SymbolTracker& s = state_[c.symbol_id];
 
-    // 1. identity: dedup / gap, ONCE, before any manager sees the bar
-    switch (Classify(c.open_time_ms, s.last_ltf_open_time)) {
-        case kDuplicate: return;
-        case kGap:       RequestRebuild(s); return;
-        case kNext:      break;
-    }
-    s.last_ltf_open_time = c.open_time_ms;
+    if (s.RebuildPending()) return;
 
-    // 2. history (inspection only)
-    s.recent_ltf.Push(c);
-
-    // 3. LTF signals
-    s.volume_surge.Update(c);
-    s.volatility.Update(c);
-    s.trend.UpdateLtf(c);
-
-    // 4. HTF, BEFORE evaluating - see the ordering note in section 5
-    if (const auto htf = s.agg.Add(c); htf) {
-        s.recent_htf.Push(*htf);
-        s.trend.UpdateHtf(*htf);
-        ApplyCandleComplete(s, TimeFrame::kHtf4h);
+    switch (s.Classify(c.open_time_ms)) {
+        case Arrival::kDuplicate:
+        case Arrival::kStale:   return;
+        case Arrival::kGap:     RequestRebuild(s); return;
+        case Arrival::kFirst:
+        case Arrival::kNext:    break;
     }
 
-    // 5. decide
-    Evaluate(s);
+    const std::optional<Candle> htf = s.ApplyLtf(c);   // BOTH timeframes update here
+
+    ApplyCandleComplete(s, TimeFrame::kH1);
+    if (htf) ApplyCandleComplete(s, TimeFrame::kH4);
+
+    Evaluate(s);                                        // ...only then the filter
 }
 ```
 
-**Why thresholds stay out:** the managers become pure functions of candle history, so
-their tests need no config; the three numbers live in one place; and `Evaluate` reads as
-the filter table from §1, which is what the debrief has to show.
+**Apply before evaluate.** The bar that closes a 4h candle must update the HTF EMA *before*
+the filter runs. Otherwise, on one bar in four, the trend test compares a fresh 1h close
+against a one-period-stale EMA50 — wrong once every four hours, which is rare enough to
+survive casual testing and frequent enough to matter. `ApplyLtf` updating both sides is
+what makes the ordering structural rather than a convention a later edit can break.
 
-**Alternative (rejected):** `IsSatisfied()` inside each manager. Fewer lines at the call
-site, but each manager then needs the config, and the definition of ACTIVE is spread over
-three files with no single place to read it.
+### Thresholds live in CoreManager
 
-### Readiness is per signal
+```cpp
+inline constexpr int64_t kSurgeNumerator   = 130;   // recent/prev > 1.30
+inline constexpr int64_t kSurgeDenominator = 100;
+inline constexpr int32_t kMinNatrBp        = 100;   // 1.00 %
+```
 
-Each manager reports its own `ready`: 48 LTF bars for the surge, ~150 HTF bars for EMA50,
-15 LTF bars for ATR(14). `is_ready` is the AND of the three.
+```cpp
+c.ready      = turnover.ready && ltf.AtrReady() && htf.EmaReady();
+c.surge      = (__int128)turnover.recent * kSurgeDenominator
+             > (__int128)turnover.prev   * kSurgeNumerator;
+c.trend      = ltf.LastClose() > htf.GetEma();
+c.volatility = ltf.GetNatrBp() > kMinNatrBp;
+```
 
-**Why not one `is_valid` flag on the symbol:** a single flag has to encode the maximum of
-three different warm-up requirements, and it silently becomes wrong the moment a period or
-a window size changes in config. Each manager already knows how much history it has
-consumed.
+`Conditions` is returned rather than collapsed to a `bool`, so a transition is logged with
+*which* condition failed. "INACTIVE" alone is undiagnosable after the fact, and these
+transitions are the product.
 
 ### The active set
 
 ```cpp
-std::unordered_set<Symbol> active_instruments_;   // CoreManager-owned
+std::unordered_set<Symbol> active_instruments_;
 ```
 
 Keyed by symbol string, on purpose: it is touched only on a *transition* (at most once per
-symbol per hour) and it is read by the printer and the notifier, both of which want the
-name. String hashing never reaches the message path, where dispatch is
-`state_[candle.symbol_id]` — an array index.
+symbol per hour) and it is read by the printer, which wants the name. String hashing never
+reaches the message path, where dispatch is `state_[candle.symbol_id]` — an array index.
 
 **Rejected:** the two-map shape from `shema.md`
 (`unordered_map<Symbol, CandleManager> tracked_` + `active_`). Holding `CandleManager`
 *by value* in both means two copies of every signal, and "which copy is current" becomes a
-question the design has to answer. One owner (`std::vector<SymbolState>`, indexed by id)
+question the design has to answer. One owner (`std::vector<SymbolTracker>`, indexed by id)
 plus a set of *names* has one answer.
-
-### Dedup state is owned by SymbolState, not by a manager
-
-The three managers never see a bar the identity check rejected. If each tracked its own
-`last_open_time`, a bar could be accepted by one and rejected by another, leaving the
-symbol permanently inconsistent with no way to detect it. One owner, checked once, before
-step 3.
 
 ---
 
 ## 7. Warm-up, gaps and rebuild
 
-**[not implemented]** — this is the core correctness argument of the project.
+**[done]** — `control_manager/control_manager.cpp`, `md_core/core.cpp`.
+This is the core correctness argument of the project.
 
 ### Warm-up — one REST call per symbol, LTF only
 
@@ -597,11 +711,16 @@ warm-up path exactly:
    symbol never contributes to the output), appends the id to `pending_rebuilds_`, and
    **returns**.
 2. The main loop, after the current frame is fully handled, drains `pending_rebuilds_`:
-   for each id, reset that symbol's three managers and aggregator, then run the same
+   for each id, reset that symbol's two trackers and aggregator, then run the same
    `Warmup()` call as at startup.
-3. Any live bar that closed during the blocking REST call is still in the socket buffer.
-   It arrives afterwards with an `open_time` the refetch already covered, so the dedup
-   rule drops it. Nothing is lost and nothing is applied twice.
+3. Any live bar that closed while the refetch was in flight is handled without a buffer:
+   `rebuild_pending_` makes `ApplyCandle` drop it, and the refetch pulls 603 bars, which
+   already contain it. Nothing is lost and nothing is applied twice.
+
+   This is why the rebuild path deliberately **drops** rather than buffering, unlike
+   startup. The two look symmetric and are not: a rebuild's window is ~364 ms and a full
+   603-bar refetch covers it, whereas startup's window is ~18 s and the history fetched at
+   its *start* cannot cover a bar that closes near its *end*.
 
 **Why the rebuild is deferred and not inline.** Calling `Warmup()` from inside
 `ApplyCandle` would re-enter `ApplyCandle` once per history bar while the outer call is
@@ -770,7 +889,10 @@ All **[verified 2026-10-09]**:
 
 ## 9. Testing
 
-**[not implemented]** except `tests/unit_tests/src/test_spsc_queue.cpp`, which is reusable
+**[partial]** — 73 tests pass under both the plain debug and the ASan+UBSan builds
+(`test_indicators`, `test_htf_aggregator`, `test_core`, `test_bybit_parser`,
+`test_spsc_queue`). What is still missing is listed at the end of this section.
+`tests/unit_tests/src/test_spsc_queue.cpp` is reusable
 as-is.
 
 Per the working mode, every DRILL component ships with its own unit tests, written
@@ -792,7 +914,7 @@ alongside it:
   0.000006-scale price, since precision is the whole argument for `kPriceScale = 1e10`.
 - Overflow: a BTC-scale ATR through the NATR expression, asserting the `__int128` path is
   used and the int64 one would have wrapped.
-- Each signal manager in isolation: `Get()` before readiness, the readiness boundary
+- Each indicator in isolation: `Get()` before readiness, the readiness boundary
   (bar 47 vs 48, HTF bar 149 vs 150, ATR bar 14 vs 15), and the computed value against a
   hand-worked example.
 - CoreManager: dedup, the three `open_time` cases, HTF aggregation boundaries, **the
@@ -900,15 +1022,28 @@ screener/
    `kVolumeScale = 1e6`, no floating point (§3).
 2. **`SpscQueue`** — rewrite cold as DRILL #13, or reuse the existing one and drill only
    the TSan stress test and the padding benchmark?
-3. **Bybit WS limits (§8)** — max args per subscribe request for `linear`, and max topics
-   per connection. Both are undocumented for `linear` and the MVP assumes one connection
-   holds the whole universe with 10 topics per subscribe frame. **Check on the first
-   run.** (The "is 1–60 s a guarantee?" question is gone: nothing depends on it now that
-   the data-silence watchdog is replaced by the missed-pong check.)
+3. **Bybit WS limits (§8)** — partly answered. **Measured 2026-10-09:** 791 topics at
+   `topics_per_subscribe = 100` → 8 frames, all 8 acked `success:true` on one connection,
+   8018 frames received in 100 s, 0 reconnects. So one connection holds the whole universe
+   and 100 args per frame is accepted. Still open: where the actual ceiling is — the
+   21,000-character args cap is `[unverified]` for `linear` (§8), and `config.h`'s comment
+   states it as fact, which overstates what we know. Worth one run at
+   `--topics-per-sub=800`. (The "is 1–60 s a guarantee?" question is gone: nothing depends
+   on it now that the data-silence watchdog is replaced by the missed-pong check.)
 4. **Transition output** — console table only, or also a JSONL event log? The prompt's
    definition of done requires the table and "logs transitions"; a structured log is cheap
    and makes the demo reproducible.
-5. **`screener_prompt.md` is still written against Binance** — the filter, the roadmap and
+5. **The startup buffer's replay path has never run** (§2). Both live runs replayed 0
+   candles because no hour boundary fell inside the 18 s warm-up, which is the expected
+   0.5 %. It needs either a `ControlManager` test with an injected REST source, or a run
+   started deliberately ~20 s before the hour. Until then the reconciliation is argued,
+   not demonstrated.
+6. **A failed rebuild is permanent.** `CoreManager::Warmup` is what clears
+   `rebuild_pending_`, so if the refetch fails the flag stays set, every subsequent bar for
+   that symbol is dropped, and `RequestRebuild` early-returns so nothing re-queues it. The
+   symbol is INACTIVE forever. Fail-safe but not self-healing; needs a
+   `CoreManager::ClearRebuildPending` plus a retry with backoff.
+7. **`screener_prompt.md` is still written against Binance** — the filter, the roadmap and
    the exercise list all still apply unchanged, but every API fact in its §2 is wrong for
    this project. Either annotate it or treat §8 of this file as the only venue reference.
 
@@ -956,16 +1091,17 @@ Correctness features only. All of these are needed for the screener to be a scre
 | Provider → core | **direct callback** into `CoreManager::ApplyCandle` |
 | Symbol universe | `instruments-info` with cursor pagination, filtered to Trading/USDT/LinearPerpetual |
 | Symbol → id | `std::unordered_map<std::string, uint32_t>`, built once at startup |
-| Symbol state | `std::vector<SymbolState>`, indexed by id |
+| Symbol state | `std::vector<SymbolTracker>`, indexed by id |
 | Candle history | `std::deque<Candle>` / `std::deque<Volume>` |
 | Candle | natural layout, `int64_t` fields, no size assert |
 | Indicators | plain classes, no CRTP, integer math per §3 |
-| Warm-up | **one REST call per symbol, `interval=60` only**; HTF aggregated locally (§7) |
+| Warm-up | **async, 16 concurrent, one REST call per symbol, `interval=60` only**; HTF aggregated locally (§7) |
+| Startup race | subscribe first, buffer into `startup_buffer_`, replay on the last warm-up response (§2) |
 | Connections | **one** WebSocket for the whole universe, batched subscribe |
 | Liveness | missed-pong check on the mandatory 20 s ping; no data-silence watchdog |
-| Rebuild | deferred to the main loop, blocking REST, reuses the warm-up path |
+| Rebuild | deferred to the main loop, **async** REST, reuses the warm-up path |
 | Discard | parse the frame, check `confirm` — **no raw-string prefilter yet** |
-| REST pacing | self-paced against 600/5 s, simple sleep-based limiter |
+| REST pacing | self-paced against 600/5 s; one sliding window, `Acquire()` blocking + `AsyncAcquire()` on the loop |
 | Output | console table + transition log lines |
 | Tests | the full correctness suite from §9 (this is not an optimisation) |
 
@@ -979,7 +1115,7 @@ What the MVP deliberately does **not** have, with the reason it is safe to omit:
 | `warmup_buffer` | warm-up completes before the subscribe, so no live bar overlaps it | REST moves off this thread |
 | Data-silence watchdog | one connection for all symbols; the threshold would be a guess | never — the missed-pong check is strictly better |
 | HTF REST fetch | the live aggregator builds it, so the two cannot disagree | never |
-| Non-blocking REST | a rebuild stall is a few hundred ms and loses nothing | a rebuild storm makes the stall add up |
+| ~~Non-blocking REST~~ | **done** — warm-up and rebuild are async; only `instruments-info` still blocks, before `ioc.run()` | n/a |
 
 Phase 0 is **done** when: the screener runs live against Bybit, warm-up completes for the
 full universe, closed bars arrive and move symbols between ACTIVE and INACTIVE, a killed

@@ -1,14 +1,14 @@
 # md_core/CMakeLists.txt
+#
+# The domain: candle state, the indicators, and the ACTIVE/INACTIVE decision.
+# Depends on types and logger only - never on md_provider, so no venue
+# protocol detail can reach it.
 add_library(md_core STATIC
-    md_core.cpp
-    flat_order_book.cpp
-    consolidated_bbo.cpp
-    consolidated_book.cpp
-    consolidated_state.cpp
+    core.cpp
 )
 
 target_include_directories(md_core PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PROJECT_SOURCE_DIR}
 )
 
 target_link_libraries(md_core PUBLIC
