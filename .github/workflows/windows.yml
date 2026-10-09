@@ -1,0 +1,53 @@
+name: windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image already ships vcpkg at VCPKG_INSTALLATION_ROOT, but
+      # our CMakeLists/CMakePresets look for VCPKG_ROOT (see root
+      # CMakeLists.txt and the vcpkg-x64-windows preset) - alias it rather
+      # than cloning a second vcpkg.
+      - name: Point VCPKG_ROOT at the preinstalled vcpkg
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      # clang-cl, matching the local CMakePresets.json toolchain, and Ninja,
+      # which the presets use as the generator.
+      - name: Set up MSVC dev environment (clang-cl)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Set up Ninja
+        run: choco install ninja -y --no-progress
+
+      # Keyed on vcpkg.json: a dependency bump invalidates the cache, an
+      # unrelated code change reuses it. Without this every push rebuilds
+      # Boost from source (~15-20 min).
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build\vcpkg_installed
+          key: vcpkg-x64-windows-static-${{ hashFiles('vcpkg.json') }}
+
+      - name: Configure
+        run: cmake --preset vcpkg-x64-windows
+
+      - name: Build
+        run: cmake --build --preset vcpkg-x64-windows
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload screener.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-windows-x64
+          path: build\screener.exe
