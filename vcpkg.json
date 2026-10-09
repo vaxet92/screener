@@ -1,0 +1,12 @@
+{
+  "name": "screener",
+  "version": "0.1.0",
+  "dependencies": [
+    "fmt",
+    "gtest",
+    "boost-asio",
+    "boost-beast",
+    "openssl",
+    "simdjson"
+  ]
+}

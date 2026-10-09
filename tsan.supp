@@ -1,0 +1,20 @@
+# ThreadSanitizer suppressions.
+#
+# Wired into the tsan build only, via gtest_discover_tests(... PROPERTIES
+# ENVIRONMENT TSAN_OPTIONS=suppressions=...) in tests/unit_tests/CMakeLists.txt.
+#
+# RULE: nothing in this file may name a symbol from our own code. Our code is
+# the signal TSan exists to give us - above all the SpscQueue, whose whole
+# point is that TSan proves the acquire/release pairing. Suppressing anything
+# of ours would hide the one result this build is for.
+#
+# Every entry must be an uninstrumented third-party library whose internals
+# TSan cannot see accurately, with the observed test named.
+#
+# EMPTY ON PURPOSE. The gRPC/Abseil/ZeroMQ entries this file used to carry
+# belonged to the consolidated-book project and those libraries are no longer
+# dependencies. The remaining uninstrumented libraries are Boost
+# (Asio/Beast) and OpenSSL; whether they produce false positives here has NOT
+# been observed yet, and inventing a suppression for a race nobody has seen
+# would risk hiding a real one. Add entries only when a false positive is
+# actually reproduced, and record the test that produced it.
