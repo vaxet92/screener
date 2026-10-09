@@ -50,4 +50,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: screener-windows-x64
-          path: build\screener.exe
+          path: build\control_manager\screener.exe

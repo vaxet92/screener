@@ -40,6 +40,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(MSVC)
     add_compile_options(/W4 /WX /permissive- /utf-8 /bigobj)
     add_compile_definitions(_WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+
+    # clang-cl + lld-link do not auto-link clang's compiler-rt builtins the
+    # way clang does on Linux/macOS, so __int128 division/modulo (the NATR
+    # and surge arithmetic - see numeric representation in CLAUDE.md) is left
+    # as an undefined __udivti3/__umodti3 at link time. Ask the compiler for
+    # its own builtins library path rather than hardcoding an LLVM-version-
+    # specific one.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        execute_process(
+            COMMAND "${CMAKE_CXX_COMPILER}" --rtlib=compiler-rt -print-libgcc-file-name
+            OUTPUT_VARIABLE CLANG_RT_BUILTINS_LIB
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(EXISTS "${CLANG_RT_BUILTINS_LIB}")
+            add_link_options("${CLANG_RT_BUILTINS_LIB}")
+        endif()
+    endif()
 else()
     add_compile_options(-Wall -Wextra -Werror)
 endif()

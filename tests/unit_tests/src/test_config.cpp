@@ -35,6 +35,25 @@ std::optional<ScreenerConfig> FromArgs(std::vector<std::string> args) {
     return ScreenerConfig::FromArgs(static_cast<int>(argv.size()), argv.data());
 }
 
+// setenv/unsetenv are POSIX; MSVC's CRT has no equivalent and only provides
+// _putenv_s, which removes a variable when given an empty value string
+// (documented Windows behaviour) rather than needing a separate unset call.
+#ifdef _WIN32
+void SetEnvVar(const char* name, const char* value) {
+    _putenv_s(name, value);
+}
+void UnsetEnvVar(const char* name) {
+    _putenv_s(name, "");
+}
+#else
+void SetEnvVar(const char* name, const char* value) {
+    ::setenv(name, value, 1);
+}
+void UnsetEnvVar(const char* name) {
+    ::unsetenv(name);
+}
+#endif
+
 std::string WriteTempEnv(const std::string& content) {
     const std::string path = std::string(testing::TempDir()) + "screener_test.env";
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -149,8 +168,8 @@ TEST(DotEnvFile, RejectsASecretThatCannotGoInAUrl) {
     // names the cause instead of a 400 an hour later.
     const std::string path = WriteTempEnv("TELEGRAM_BOT_TOKEN='123 AAA'\nTELEGRAM_CHAT_ID=-1001\n");
 
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     const auto c = FromArgs({"--telegram", "--env-file=" + path});
     std::remove(path.c_str());
@@ -197,12 +216,12 @@ TEST(DotEnv, RejectsAnEmptyKey) {
 TEST(DotEnvFile, TheShellWinsOverTheFile) {
     const std::string path = WriteTempEnv("TELEGRAM_BOT_TOKEN=from_file\nTELEGRAM_CHAT_ID=-1001\n");
 
-    ::setenv("TELEGRAM_BOT_TOKEN", "from_shell", 1);
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    SetEnvVar("TELEGRAM_BOT_TOKEN", "from_shell");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     const auto c = FromArgs({"--telegram", "--env-file=" + path});
 
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
     std::remove(path.c_str());
 
     ASSERT_TRUE(c.has_value());
@@ -212,8 +231,8 @@ TEST(DotEnvFile, TheShellWinsOverTheFile) {
 }
 
 TEST(DotEnvFile, AnExplicitPathThatCannotBeReadIsFatal) {
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     // Asymmetric on purpose: a missing DEFAULT .env means "use the
     // environment", but a path the operator typed must exist.
@@ -223,8 +242,8 @@ TEST(DotEnvFile, AnExplicitPathThatCannotBeReadIsFatal) {
 TEST(DotEnvFile, TelegramWithoutSecretsIsRefused) {
     const std::string path = WriteTempEnv("# nothing here\n");
 
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     const auto c = FromArgs({"--telegram", "--env-file=" + path});
     std::remove(path.c_str());

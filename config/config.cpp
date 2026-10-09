@@ -350,12 +350,22 @@ std::optional<ScreenerConfig> ScreenerConfig::FromArgs(int argc, char* argv[]) {
         return std::nullopt;
     }
 
+    // MSVC flags getenv as unsafe against concurrent setenv/putenv; this
+    // runs once at startup, single-threaded, before io_context starts, so
+    // that race cannot occur here.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
     if (const char* token = std::getenv("TELEGRAM_BOT_TOKEN")) {
         config.telegram_token = token;
     }
     if (const char* chat_id = std::getenv("TELEGRAM_CHAT_ID")) {
         config.telegram_chat_id = chat_id;
     }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
     // Print the REASON before returning nullopt. The caller only knows
     // "unusable" and answers with the usage text, so without this line
