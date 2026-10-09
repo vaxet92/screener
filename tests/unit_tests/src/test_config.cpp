@@ -1,0 +1,234 @@
+// Dotenv parsing, and the precedence rule around it.
+//
+// ApplyDotEnv is tested on CONTENT, with no filesystem: it is a parser, and a
+// parser's failure modes are its lines, not its inode. The precedence test
+// goes through FromArgs with a real temporary file, because "the shell wins
+// over the file" is a property of the ORDER of two reads and cannot be
+// observed in the parser alone.
+
+#include <gtest/gtest.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+
+#include "config/config.h"
+
+namespace screener {
+namespace {
+
+ScreenerConfig Parse(const std::string& content, std::string& error) {
+    ScreenerConfig config;
+    error = ApplyDotEnv(content, config);
+    return config;
+}
+
+// argv is char*, and FromArgs takes it as such.
+std::optional<ScreenerConfig> FromArgs(std::vector<std::string> args) {
+    std::vector<char*> argv;
+    std::string program = "screener";
+    argv.push_back(program.data());
+    for (std::string& a : args) {
+        argv.push_back(a.data());
+    }
+    return ScreenerConfig::FromArgs(static_cast<int>(argv.size()), argv.data());
+}
+
+std::string WriteTempEnv(const std::string& content) {
+    const std::string path = std::string(testing::TempDir()) + "screener_test.env";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << content;
+    return path;
+}
+
+}  // namespace
+
+TEST(DotEnv, ReadsBothSecrets) {
+    std::string error;
+    const ScreenerConfig c = Parse("TELEGRAM_BOT_TOKEN=123:AAA\nTELEGRAM_CHAT_ID=-1001\n", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+    EXPECT_EQ(c.telegram_chat_id, "-1001");
+}
+
+TEST(DotEnv, SkipsCommentsBlankLinesAndWhitespace) {
+    std::string error;
+    const ScreenerConfig c = Parse(
+        "# a comment\n"
+        "\n"
+        "   \n"
+        "  TELEGRAM_BOT_TOKEN = 123:AAA  \n"
+        "\t# indented comment\n",
+        error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+}
+
+TEST(DotEnv, AcceptsQuotesAndAnExportPrefix) {
+    std::string error;
+    // Quoting is how a chat_id starting with '-' gets written, and `export
+    // KEY=VALUE` is what a line copied out of a shell looks like.
+    const ScreenerConfig c = Parse("export TELEGRAM_CHAT_ID=\"-1001234567890\"\nTELEGRAM_BOT_TOKEN='123:AAA'\n", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_chat_id, "-1001234567890");
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+}
+
+TEST(DotEnv, HandlesCrlfAndAMissingFinalNewline) {
+    std::string error;
+    const ScreenerConfig c = Parse("TELEGRAM_BOT_TOKEN=123:AAA\r\nTELEGRAM_CHAT_ID=-1001", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+    EXPECT_EQ(c.telegram_chat_id, "-1001");
+}
+
+TEST(DotEnv, StripsAnInlineCommentAfterAnUnquotedValue) {
+    std::string error;
+    const ScreenerConfig c = Parse("TELEGRAM_BOT_TOKEN=123:AAA  # from @BotFather\n", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+}
+
+TEST(DotEnv, StripsAnInlineCommentAfterAQuotedValue) {
+    std::string error;
+    // The regression that produced a 400: with a comment after the closing
+    // quote, "strip matching outer quotes" never fires, and the token kept
+    // its quotes AND the comment - spaces and all - straight into the URL.
+    const ScreenerConfig c = Parse(
+        "TELEGRAM_BOT_TOKEN = \"123:AAA\"  # from @BotFather\n"
+        "TELEGRAM_CHAT_ID = '-1001'  # from @userinfobot\n",
+        error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+    EXPECT_EQ(c.telegram_chat_id, "-1001");
+}
+
+TEST(DotEnv, KeepsAHashInsideQuotes) {
+    std::string error;
+    const ScreenerConfig c = Parse("TELEGRAM_BOT_TOKEN=\"123:AA#BB\"\n", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AA#BB");
+}
+
+TEST(DotEnv, RejectsAnUnterminatedQuote) {
+    std::string error;
+    Parse("TELEGRAM_BOT_TOKEN=\"123:AAA\n", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(DotEnv, RejectsJunkAfterAQuotedValue) {
+    std::string error;
+    Parse("TELEGRAM_BOT_TOKEN=\"123:AAA\" junk\n", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(DotEnvFile, RejectsASecretThatCannotGoInAUrl) {
+    // Belt and braces for the same failure: even if a secret reaches the
+    // config with a space or a quote in it, the run stops with a message that
+    // names the cause instead of a 400 an hour later.
+    const std::string path = WriteTempEnv("TELEGRAM_BOT_TOKEN='123 AAA'\nTELEGRAM_CHAT_ID=-1001\n");
+
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    const auto c = FromArgs({"--telegram", "--env-file=" + path});
+    std::remove(path.c_str());
+
+    EXPECT_FALSE(c.has_value());
+}
+
+TEST(DotEnv, IgnoresKeysItDoesNotOwn) {
+    std::string error;
+    // A .env is shared with whatever else runs in this directory. Failing on
+    // another tool's variable would be this process overreaching.
+    const ScreenerConfig c = Parse("DATABASE_URL=postgres://x\nTELEGRAM_BOT_TOKEN=123:AAA\nPATH_EXTRA=/opt\n", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.telegram_token, "123:AAA");
+}
+
+TEST(DotEnv, RejectsALineWithNoEquals) {
+    std::string error;
+    Parse("TELEGRAM_BOT_TOKEN=123:AAA\nTELEGRAM_CHAT_ID -1001\n", error);
+
+    // A typo in a secrets file stops the run, exactly like an unknown flag.
+    ASSERT_FALSE(error.empty());
+    EXPECT_NE(error.find("line 2"), std::string::npos) << error;
+}
+
+TEST(DotEnv, RejectsAnEmptyValueForAKeyItOwns) {
+    std::string error;
+    Parse("TELEGRAM_BOT_TOKEN=\n", error);
+
+    // Not a default: the operator meant to set it. Silently empty would show
+    // up as "--telegram needs TELEGRAM_BOT_TOKEN" with the variable sitting
+    // right there in the file.
+    ASSERT_FALSE(error.empty());
+    EXPECT_NE(error.find("TELEGRAM_BOT_TOKEN"), std::string::npos) << error;
+}
+
+TEST(DotEnv, RejectsAnEmptyKey) {
+    std::string error;
+    Parse("=value\n", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(DotEnvFile, TheShellWinsOverTheFile) {
+    const std::string path = WriteTempEnv("TELEGRAM_BOT_TOKEN=from_file\nTELEGRAM_CHAT_ID=-1001\n");
+
+    ::setenv("TELEGRAM_BOT_TOKEN", "from_shell", 1);
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    const auto c = FromArgs({"--telegram", "--env-file=" + path});
+
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    std::remove(path.c_str());
+
+    ASSERT_TRUE(c.has_value());
+    // The file supplies defaults; an explicit export redirects one run.
+    EXPECT_EQ(c->telegram_token, "from_shell");
+    EXPECT_EQ(c->telegram_chat_id, "-1001");
+}
+
+TEST(DotEnvFile, AnExplicitPathThatCannotBeReadIsFatal) {
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    // Asymmetric on purpose: a missing DEFAULT .env means "use the
+    // environment", but a path the operator typed must exist.
+    EXPECT_FALSE(FromArgs({"--env-file=/nonexistent/screener/.env"}).has_value());
+}
+
+TEST(DotEnvFile, TelegramWithoutSecretsIsRefused) {
+    const std::string path = WriteTempEnv("# nothing here\n");
+
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    const auto c = FromArgs({"--telegram", "--env-file=" + path});
+    std::remove(path.c_str());
+
+    // --telegram is an explicit request; honouring it as a no-op is the
+    // failure nobody notices until the first ACTIVE never arrives.
+    EXPECT_FALSE(c.has_value());
+}
+
+TEST(DotEnvFile, SecretsWithoutTheFlagLeaveNotificationsOff) {
+    const std::string path = WriteTempEnv("TELEGRAM_BOT_TOKEN=123:AAA\nTELEGRAM_CHAT_ID=-1001\n");
+
+    const auto c = FromArgs({"--env-file=" + path});
+    std::remove(path.c_str());
+
+    ASSERT_TRUE(c.has_value());
+    EXPECT_FALSE(c->telegram_enabled);
+}
+
+}  // namespace screener

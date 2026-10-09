@@ -18,11 +18,17 @@ int main(int argc, char* argv[]) {
     const auto config = screener::ScreenerConfig::FromArgs(argc, argv);
     if (!config) {
         std::fputs(
-            "usage: screener [--max-symbols=N] [--warmup-bars=N] [--topics-per-sub=N] [--verbose]\n"
+            "usage: screener [--max-symbols=N] [--warmup-bars=N] [--topics-per-sub=N] [--telegram]\n"
+            "                [--env-file=PATH] [--verbose]\n"
             "\n"
             "  --max-symbols=N     cap the universe (0 = every linear USDT perpetual)\n"
             "  --warmup-bars=N     1h bars to fetch per symbol at startup (4..1000, default 603)\n"
             "  --topics-per-sub=N  topics per subscribe frame (default 100)\n"
+            "  --telegram          send startup and ACTIVE/INACTIVE notifications to Telegram;\n"
+            "                      requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env or\n"
+            "                      the environment (NOT flags - argv is visible via ps)\n"
+            "  --env-file=PATH     secrets file (default .env; see .env.example). A missing\n"
+            "                      default is fine, a missing PATH you named is not\n"
             "  --verbose           debug logging\n",
             stderr);
         return 2;

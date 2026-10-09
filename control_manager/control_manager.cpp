@@ -46,7 +46,8 @@ ControlManager::ControlManager(const ScreenerConfig& config)
       ssl_ctx_(boost::asio::ssl::context::tlsv12_client),
       status_timer_(ioc_),
       signals_(ioc_, SIGINT, SIGTERM),
-      limiter_(ioc_, config.rest_max_requests_per_window, std::chrono::milliseconds(config.rest_window_ms)) {
+      limiter_(ioc_, config.rest_max_requests_per_window, std::chrono::milliseconds(config.rest_window_ms)),
+      notifier_(ioc_, ssl_ctx_, config) {
     load_root_certificates(ssl_ctx_);
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 }
@@ -213,14 +214,28 @@ void ControlManager::FinishWarmup() {
 
     // After the replay, not before: a buffered bar can be the one that tips a
     // symbol over its readiness threshold.
-    LogWarmupReadiness();
+    const TelegramNotifier::StartupReport report = LogWarmupReadiness();
+
+    // The startup notification goes out HERE, not from Run().
+    //
+    // "Tracking N instruments" is only meaningful once the universe is warm:
+    // before this point every symbol is `not ready` and none of them could
+    // have gone ACTIVE, so an earlier message would report a count the
+    // screener cannot act on yet. It also carries the symbols that came out
+    // of warm-up already ACTIVE, which is the state the chat would otherwise
+    // never be told about - those are not transitions, so no ACTIVE message
+    // will ever be sent for them.
+    notifier_.NotifyStarted(report, core_.ActiveInstruments());
 
     // A replayed bar can be a genuine gap - a symbol whose warm-up failed, or
     // one that lost more than one bar - so drain whatever the replay queued.
     PostRebuildDrain();
 }
 
-void ControlManager::LogWarmupReadiness() const {
+TelegramNotifier::StartupReport ControlManager::LogWarmupReadiness() const {
+    TelegramNotifier::StartupReport report;
+    report.tracked = core_.SymbolCount();
+
     std::size_t ready = 0;
     std::size_t not_ready = 0;
     std::size_t pass_surge = 0;
@@ -254,6 +269,16 @@ void ControlManager::LogWarmupReadiness() const {
         }
 
         ++not_ready;
+
+        // The REASON, per symbol, not just the count. Two causes look
+        // identical in a bare number and are not remotely the same problem:
+        // a brand-new listing genuinely has no history, while ltf=0 means its
+        // warm-up REQUEST failed and the symbol is missing for a reason we
+        // could fix.
+        report.not_ready.push_back(ltf_bars == 0
+                                       ? fmt::format("{} - no history (warm-up request failed)", core_.NameOf(id))
+                                       : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h)", core_.NameOf(id),
+                                                     ltf_bars, htf_bars, kEmaPeriod, kEmaPeriod));
         // kWarning rather than kDebug, because this is the quiet failure mode
         // of the whole system: a not-ready symbol can never go ACTIVE, so it
         // vanishes from the output with no error anywhere. At ~800 symbols the
@@ -269,6 +294,9 @@ void ControlManager::LogWarmupReadiness() const {
     Logger::Log(LogLevel::kInfo,
                 "readiness: {} ready, {} not ready, of {} symbols | of the ready: surge={} trend={} vol={} all={}",
                 ready, not_ready, core_.SymbolCount(), pass_surge, pass_trend, pass_vol, pass_all);
+
+    report.ready = ready;
+    return report;
 }
 
 void ControlManager::OnCandle(const Candle& c) {
@@ -301,6 +329,13 @@ void ControlManager::PostRebuildDrain() {
 
 void ControlManager::DrainRebuilds() {
     rebuild_drain_posted_ = false;
+
+    // DRILL, not yet wired: the ACTIVE/INACTIVE notifications are drained
+    // HERE too, right after the rebuild list, once CoreManager::TakeTransitions()
+    // exists (DESIGN.md §14). This is the drain point because it already runs
+    // AFTER the ApplyCandle call has returned - sending from inside
+    // TryActivate would put chat formatting on the message path and give
+    // md_core a dependency on network I/O.
 
     const std::vector<uint32_t> pending = core_.TakePendingRebuilds();
     for (const uint32_t id : pending) {
@@ -344,6 +379,7 @@ void ControlManager::ScheduleStatus() {
 
 void ControlManager::StopWith(int exit_code) {
     exit_code_ = exit_code;
+    notifier_.Stop();
     provider_->Stop();
     status_timer_.cancel();
     ioc_.stop();

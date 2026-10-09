@@ -40,7 +40,13 @@ using HttpResponseHandler = std::function<void(std::optional<std::string>)>;
 // `ssl_ctx` must outlive the request. Sharing one context with the WebSocket
 // session is intended: a context is a certificate store plus options, and on
 // one thread there is nothing to race.
+//
+// `log_target` replaces `target` in this request's log lines. Empty means
+// "log the real target", which is what every market-data call wants. It
+// exists because a target can CONTAIN A SECRET: Telegram's bot token sits in
+// the URL path, so without a redacted form one DNS blip writes a live
+// credential into the log.
 void AsyncHttpsGet(boost::asio::io_context& ioc, boost::asio::ssl::context& ssl_ctx, std::string host, std::string port,
-                   std::string target, HttpResponseHandler handler);
+                   std::string target, HttpResponseHandler handler, std::string log_target = {});
 
 }  // namespace screener

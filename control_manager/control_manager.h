@@ -45,6 +45,7 @@
 #include "md_core/core.h"
 #include "md_provider/bybit_parser.h"
 #include "md_provider/md_provider.h"
+#include "notifier/telegram_notifier.h"
 #include "types/candle.h"
 
 namespace screener {
@@ -106,7 +107,10 @@ class ControlManager {
     // ---- Live path --------------------------------------------------------
 
     // Per-symbol readiness after the replay. Loud only for NOT READY.
-    void LogWarmupReadiness() const;
+    // Returns the counts plus one line per not-ready symbol, which is what
+    // the startup notification needs to explain the gap between "tracked" and
+    // "ready" instead of leaving it as an unexplained subtraction.
+    TelegramNotifier::StartupReport LogWarmupReadiness() const;
 
     // The provider's candle callback. Buffers until warmed_up_.
     void OnCandle(const Candle& c);
@@ -124,6 +128,10 @@ class ControlManager {
 
     RateLimiter limiter_;
     BybitParser rest_parser_;
+
+    // Constructed even when --telegram is absent: disabled, every Notify* is
+    // a no-op, and there is no second code path for "no bot configured".
+    TelegramNotifier notifier_;
 
     CoreManager core_;
     std::unique_ptr<BybitProvider> provider_;

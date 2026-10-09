@@ -8,14 +8,23 @@ add_executable(unit_tests
     src/test_bybit_parser.cpp
     src/test_rate_limiter.cpp
     src/test_spsc_queue.cpp
+    src/test_telegram_notifier.cpp
+    src/test_config.cpp
 )
 
-# md_core and config are NOT listed: md_provider links both PUBLIC, so naming
-# them here too makes the linker see each archive twice ("ignoring duplicate
+# md_core, config and md_provider are NOT listed: notifier links md_provider
+# PUBLIC, which links md_core and config PUBLIC, so naming any of them here
+# too makes the linker see the same archive twice ("ignoring duplicate
 # libraries"). One edge per dependency.
 target_link_libraries(unit_tests PRIVATE
     GTest::gtest_main
-    md_provider
+    notifier
+)
+
+# The repo root, so the manual Telegram smoke test can find .env no matter
+# which directory ctest runs the binary from.
+target_compile_definitions(unit_tests PRIVATE
+    SCREENER_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
 include(GoogleTest)

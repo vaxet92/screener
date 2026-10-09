@@ -69,6 +69,7 @@ add_subdirectory(config)
 add_subdirectory(logger)
 add_subdirectory(md_core)
 add_subdirectory(md_provider)
+add_subdirectory(notifier)
 add_subdirectory(control_manager)
 
 

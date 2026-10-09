@@ -33,12 +33,14 @@ inline constexpr auto kOperationTimeout = std::chrono::seconds(30);
 class GetSession : public std::enable_shared_from_this<GetSession> {
    public:
     GetSession(net::io_context& ioc, ssl::context& ssl_ctx, std::string host, std::string port, std::string target,
-               HttpResponseHandler handler)
+               HttpResponseHandler handler, std::string log_target)
         : resolver_(ioc),
           stream_(ioc, ssl_ctx),
           host_(std::move(host)),
           port_(std::move(port)),
           target_(std::move(target)),
+          // Declared after target_, so target_ is already initialised here.
+          log_target_(log_target.empty() ? target_ : std::move(log_target)),
           handler_(std::move(handler)) {}
 
     // Not called from the constructor: shared_from_this() requires the object
@@ -114,7 +116,15 @@ class GetSession : public std::enable_shared_from_this<GetSession> {
             // 403 / retCode 10006 means the IP is rate-banned. The caller's
             // limiter is what prevents that; logging the status is how we
             // find out the limiter is set wrong.
-            Logger::Log(LogLevel::kError, "[HTTPS] GET {}{} returned status {}", host_, target_, res_.result_int());
+            // The BODY, truncated, not just the status. Both services we
+            // talk to explain a 4xx in it - Bybit with retMsg, Telegram with
+            // "description" - and without it a 400 is unexplainable from the
+            // log alone. Truncated because a non-200 body is occasionally an
+            // HTML error page.
+            constexpr std::size_t kMaxLoggedBody = 256;
+            const std::string_view body(res_.body());
+            Logger::Log(LogLevel::kError, "[HTTPS] GET {}{} returned status {}: {}{}", host_, log_target_,
+                        res_.result_int(), body.substr(0, kMaxLoggedBody), body.size() > kMaxLoggedBody ? "..." : "");
             Complete(std::nullopt);
         } else {
             Complete(std::move(res_.body()));
@@ -131,7 +141,7 @@ class GetSession : public std::enable_shared_from_this<GetSession> {
     void OnShutdown(beast::error_code) {}
 
     void Fail(std::string_view what, std::string_view detail) {
-        Logger::Log(LogLevel::kError, "[HTTPS] GET {}{} {} failed: {}", host_, target_, what, detail);
+        Logger::Log(LogLevel::kError, "[HTTPS] GET {}{} {} failed: {}", host_, log_target_, what, detail);
         Complete(std::nullopt);
     }
 
@@ -154,6 +164,11 @@ class GetSession : public std::enable_shared_from_this<GetSession> {
     std::string host_;
     std::string port_;
     std::string target_;
+
+    // What the log prints instead of target_. Equal to target_ unless the
+    // caller passed a redacted form - see the header.
+    std::string log_target_;
+
     HttpResponseHandler handler_;
 
     http::request<http::empty_body> req_;
@@ -164,8 +179,9 @@ class GetSession : public std::enable_shared_from_this<GetSession> {
 }  // namespace
 
 void AsyncHttpsGet(net::io_context& ioc, ssl::context& ssl_ctx, std::string host, std::string port, std::string target,
-                   HttpResponseHandler handler) {
-    std::make_shared<GetSession>(ioc, ssl_ctx, std::move(host), std::move(port), std::move(target), std::move(handler))
+                   HttpResponseHandler handler, std::string log_target) {
+    std::make_shared<GetSession>(ioc, ssl_ctx, std::move(host), std::move(port), std::move(target), std::move(handler),
+                                 std::move(log_target))
         ->Run();
 }
 

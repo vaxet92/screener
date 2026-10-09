@@ -1149,3 +1149,220 @@ which is what the prompt's §7 definition of done actually asks for.
 For each Phase 1 item: the baseline, the change, the new number, and the verdict. A table
 with "no measurable change" in it is a stronger artefact than one where every row is a
 win, because it shows the measurements were real.
+
+---
+
+## 14. Telegram notifications — **[partial]**
+
+A reporting sink, not a decision path. `notifier/telegram_notifier.{h,cpp}` sends three
+messages to one chat: the screener started, a symbol became ACTIVE, a symbol left ACTIVE.
+It is off unless `--telegram` is passed, and a run without it behaves exactly as it did
+before the class existed.
+
+Not in `screener_prompt.md`. Classified **[SCAFFOLD]** — it is I/O plumbing, like the REST
+client and the rate limiter — except the `CoreManager` hook, which is **[DRILL]** (§14.4).
+
+### 14.1 Transport — reuse `AsyncHttpsGet`
+
+Telegram's `sendMessage` accepts its parameters in the query string, so there is no POST
+transport to write: a send is one `AsyncHttpsGet` to `api.telegram.org`, on the same
+`io_context` and the same `ssl::context` as everything else. Nothing here blocks the
+WebSocket read loop.
+
+Two consequences worth stating:
+
+- **The bot token is in the URL path** (`/bot<token>/sendMessage`). `AsyncHttpsGet` logs
+  `host + target` on every failure, so `async_rest` grew an optional `log_target`
+  parameter that replaces the real one in log lines. Without it, one DNS blip writes a
+  live credential into the log. Market-data callers pass nothing and are unaffected.
+- **No `parse_mode`.** The text is plain UTF-8, so there is no Markdown or HTML escaping
+  to get wrong — and a symbol name is exactly the kind of string that eventually contains
+  an underscore and turns a notification into a 400 nobody reads.
+
+`notifier` links `md_provider` to reach `AsyncHttpsGet`, which is a wart: a chat notifier
+has no business depending on a market-data provider. The clean fix is to lift
+`async_rest.{h,cpp}` into its own `net` library. Deliberately not done — it is churn
+across four `CMakeLists.txt` for no behaviour change.
+
+### 14.2 Pacing, and why there is a queue
+
+Transitions arrive in **bursts**. The filter runs on a closed 1h bar, so at the top of the
+hour dozens of symbols can flip within milliseconds of each other, while Telegram's
+per-chat limit is around 20 messages per minute. Sending straight from the transition
+would earn a 429 exactly when the screener had something to say.
+
+So messages go into a FIFO drained by a `steady_timer`, one every
+`telegram_min_send_interval_ms` (default 3000 — a deliberate ~20/minute ceiling, not a
+guess). The first message in an idle period goes out immediately; the timer only paces the
+ones behind it, because a lone transition should not wait an interval for nothing.
+
+The queue is capped at `telegram_max_queue` (default 100, ~5 minutes of backlog). Past the
+cap the **new** message is dropped, not the oldest — the queue holds transitions in the
+order they happened, and discarding the head would report the chat's history out of order,
+which is harder to read than a gap in it. Drops are counted and reported into the chat
+once the queue drains, because the operator this class exists for is not reading the log.
+
+Its own timer, never the Bybit `RateLimiter`: different host, different limit, and one
+shared window would let chat traffic eat the kline request budget.
+
+### 14.3 Message shape
+
+`parse_mode=HTML`, one bold symbol per line:
+
+```
+🚀 <b>Screener started</b>
+Tracking 791 instruments: 781 ready, 10 not ready
+
+<b>Not ready (10):</b>
+AUSDT - no history (warm-up request failed)
+NEWUSDT - 12 x 1h, 3 x 4h (EMA50 needs 50 x 4h)
+...
+
+<b>Active (39):</b>
+<b>AMZUUSDT</b>
+<b>API3USDT</b>
+...
+```
+
+**HTML and not MarkdownV2.** Bold needs a `parse_mode`, and MarkdownV2 requires 18
+characters escaped (``_*[]()~`>#+-=|{}.!``) against HTML's three (`&<>`). One missed
+character is a 400 on a notification nobody sees fail, so the smaller escape surface wins.
+Every dynamic value goes through `HtmlEscape` before it reaches a message.
+
+**The ready gap is spelled out, not left as a subtraction.** "791 tracked, 781 ready" is
+ten instruments that silently dropped out of the product, and the two causes behind it are
+not the same problem: a new listing genuinely has no history, while `ltf=0` means its
+warm-up *request* failed and the symbol is missing for a reason we could fix. So every
+not-ready symbol is named with its bar counts, or with "warm-up request failed".
+
+**The active list is complete by default** (`telegram_active_list_max = 0`). A truncated
+list hides exactly the symbol the operator went looking for. Length is handled by
+`Enqueue`, which splits an oversized message **on line boundaries** into several — line
+boundaries because a cut inside `<b>...</b>` is a 400 on both halves. The knob stays for
+the other problem: a few hundred ACTIVE symbols means every transition re-sends a list two
+messages long, and capping that is a chat-noise decision rather than a protocol limit.
+
+One symbol per line because these are read on a phone, where a comma-separated run of 39
+tickers is a wall.
+
+The startup message also carries the symbols that came out of warm-up **already** ACTIVE.
+Those are not transitions, so no ACTIVE message is ever sent for them, and without this the
+chat would never learn about them.
+
+
+### 14.4 Where the hooks are — and the one that is [DRILL]
+
+`NotifyStarted` is wired in `ControlManager::FinishWarmup`, after the replay and after
+`LogWarmupReadiness` (which now returns the ready count). Not from `Run()`: before warm-up
+every symbol is `not ready`, so an earlier message would report a count the screener cannot
+act on yet.
+
+The ACTIVE/INACTIVE hook is **[not implemented]** and is a DRILL for Anton:
+
+```cpp
+struct Transition { uint32_t symbol_id; bool active; };
+std::vector<Transition> TakeTransitions();   // swap-out, like TakePendingRebuilds()
+```
+
+- `TryActivate` pushes `{id, true}`, `TryDeactivate` pushes `{id, false}`, edge-triggered.
+- **`RequestRebuild` must also push `{id, false}`** — it forces INACTIVE inline and
+  bypasses `TryDeactivate`. Miss it and the chat keeps showing a symbol as active after a
+  gap has invalidated it.
+- `SetUniverse` clears the list.
+
+`ControlManager` drains it in `DrainRebuilds`, next to the rebuild drain, which is already
+`post`ed and therefore already runs after `ApplyCandle` has returned. A direct
+`std::function` call from inside `TryActivate` was rejected for two reasons: it would put
+chat formatting and a URL-encode on the message path, and it would give `md_core` a
+dependency on network I/O. Until the hook lands, transitions reach the log only.
+
+### 14.5 Credentials — `.env`, then the environment
+
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are never flags: a token in `argv` is readable
+by any user via `ps` and lands in shell history. That is the one reason this project reads
+anything other than `argv` — secrets are the exception to "every tunable is a flag", not a
+second configuration mechanism.
+
+Two sources, read in this order:
+
+1. **`.env`** in the working directory, `--env-file=PATH` to move it. Gitignored, with a
+   checked-in `.env.example`. A missing default `.env` is fine — that is the CI and
+   container case, where the variables come from the environment. A missing file the
+   operator *named* is an error, because they said where to look.
+2. **The process environment**, which **wins**. The file supplies defaults so a normal run
+   needs no exports; an explicit export still redirects one run to a test chat without
+   editing the file.
+
+`ApplyDotEnv` is deliberately not a dotenv implementation: no interpolation, no multi-line
+values, no `.env.local` layering. `KEY=VALUE` per line, `#` comments (whole-line **and
+inline**), blank lines, an optional `export ` prefix, optional surrounding quotes (which is
+how a `chat_id` starting with `-` gets written without looking like a flag).
+
+**The inline comment is the part that bit us.** `TELEGRAM_BOT_TOKEN = "123:AAA"  # from
+@BotFather` is what a hand-written `.env` looks like, and the first version only stripped
+quotes when the first *and last* character of the value were matching quotes — which the
+trailing comment prevents. The token therefore kept its quotes *and* the comment, went into
+the request path spaces and all, and Telegram answered **400 from its HTTP parser**, before
+the Bot API saw anything. The fix is `ExtractValue`: a quoted value ends at its closing
+quote and only a comment may follow; an unquoted value ends at the first `#`.
+
+Two defences, because a secret that is silently wrong is expensive to diagnose:
+
+- `Validate()` rejects a token or `chat_id` containing a space, control character, quote or
+  `#`. Both go into the request line, so those characters cannot produce anything but a
+  malformed request — refusing at startup names the cause, a 400 an hour into a run does
+  not.
+- `AsyncHttpsGet` now logs the response **body** on a non-200, truncated to 256 bytes. Both
+  services explain a 4xx in it (Bybit in `retMsg`, Telegram in `description`), and without
+  it a status code alone is unexplainable.
+
+Two more rules worth stating:
+
+- **Unknown keys are ignored.** A `.env` is shared with whatever else runs in the
+  directory, so failing on another tool's `DATABASE_URL` would be this process
+  overreaching.
+- **A malformed line, or an empty value for a key we own, is fatal** — the same strictness
+  as an unrecognised flag. A silently skipped `TELEGRAM_CHAT_ID` line would surface much
+  later as "needs TELEGRAM_CHAT_ID" with the variable sitting right there in the file.
+
+A `.env` readable by other users is **warned** about, not rejected: a 644 file on a dev
+laptop is normal, and refusing to start over it is the wrong trade.
+
+Neither source enables notifications; `--telegram` does. `--telegram` with either secret
+missing is a **validation failure**, not a silent no-op: honouring the flag by doing
+nothing is exactly the failure nobody notices until the first ACTIVE never arrives.
+
+### 14.6 Testing
+
+`tests/unit_tests/src/test_config.cpp`, 12 tests: the dotenv parser on *content*, because a
+parser's failure modes are its lines and not its inode — comments, whitespace, quotes, an
+`export` prefix, CRLF, a missing final newline, unknown keys, and each fatal case. Four go
+through `FromArgs` with a temporary file, for the properties only the read ORDER can show:
+the shell beating the file, an explicitly named missing path being fatal, `--telegram`
+without secrets being refused, and secrets without `--telegram` leaving notifications off.
+
+`tests/unit_tests/src/test_telegram_notifier.cpp`, 13 tests. Twelve inject a `Sender` and
+use no network and no token: what is worth testing is not "does an HTTPS GET work" but the
+message format, the HTML escaping, the sort, the burst order, the drop policy and its
+report, that a disabled notifier is inert, and the split: a 1000-symbol list must come out
+as several messages, each under 4096 characters, each with balanced `<b>` tags, with no
+symbol lost across the cut — all pure functions of the queue.
+
+One uses the **real** transport, because it is the only way to check what the
+transport *logs*: it points `telegram_host` at a name in `.invalid` (RFC 2606 reserves it
+as never-resolvable, so the test fails at DNS and never opens a socket), captures stdout,
+and asserts the token does not appear and `<redacted>` does. That is the one regression
+worth a test here — dropping the `log_target` argument leaks a live credential, and
+nothing else would catch it.
+
+A successful send is **not** unit-tested — faking Telegram's server would test the fake.
+It has a `DISABLED_` manual smoke test instead, `TelegramNotifierManual.SendsHelloToTheRealChat`:
+
+```
+./unit_tests --gtest_also_run_disabled_tests --gtest_filter='*SendsHello*'
+```
+
+It reads the real `.env` (via `SCREENER_SOURCE_DIR`, so it works from the build tree),
+sends a realistic startup message through the real transport, and prints what came back. It asserts nothing about the send: the outcome depends on a bot and a `chat_id` this
+process cannot verify, so what it gives you is Telegram's own response body. `GTEST_SKIP`
+when there is no usable `.env`, and `DISABLED_` so a normal run never touches the network.

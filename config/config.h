@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace screener {
 
@@ -94,9 +95,65 @@ struct ScreenerConfig {
     // floor, not a backoff seed.
     uint32_t rest_ban_backoff_ms = 600'000;
 
+    // ---- Telegram notifications ------------------------------------------
+
+    // Off unless --telegram is passed. The screener runs identically with and
+    // without a bot: the notifier is a reporting sink, never a decision path.
+    bool telegram_enabled = false;
+
+    // Read from `.env` and from the ENVIRONMENT (TELEGRAM_BOT_TOKEN,
+    // TELEGRAM_CHAT_ID), never from a flag.
+    //
+    // A token on the command line is readable by every user on the box
+    // through `ps`, and it lands in shell history. That is the one reason
+    // this project reads anything other than argv - secrets are the exception
+    // to "every tunable is a flag", not a second configuration mechanism.
+    //
+    // The SHELL WINS over the file: `.env` supplies defaults so a normal run
+    // needs no exports, and an explicit export still redirects one run to a
+    // test chat without editing the file.
+    std::string telegram_token;
+    std::string telegram_chat_id;
+
+    // Where those two are read from. A missing default file is fine (it means
+    // "use the environment"); a missing file named explicitly with
+    // --env-file= is an error, because the operator said where to look.
+    std::string env_file = ".env";
+
+    std::string telegram_host = "api.telegram.org";
+    std::string telegram_port = "443";
+
+    // Minimum gap between two messages.
+    //
+    // Transitions arrive in bursts: the filter runs on a closed 1h bar, so
+    // dozens of symbols can flip within milliseconds at the top of the hour.
+    // Telegram's per-chat limit is around 20 messages/minute, so 3s is a
+    // deliberate ~20/minute ceiling rather than a guess.
+    uint32_t telegram_min_send_interval_ms = 3000;
+
+    // Queue cap. At 3s apart this is ~5 minutes of backlog, which is far
+    // longer than one hourly burst can legitimately be - so hitting it means
+    // the chat is hopelessly behind and dropping is the right answer. Drops
+    // are counted and reported into the chat.
+    uint32_t telegram_max_queue = 100;
+
+    // Symbols listed before the active list is truncated. 0 = ALL of them,
+    // which is the default: a truncated list hides exactly the symbol the
+    // operator went looking for.
+    //
+    // Telegram still rejects a message over 4096 characters, but length is
+    // handled by splitting an oversized message on line boundaries rather
+    // than by dropping symbols. This knob exists for the other problem - a
+    // few hundred ACTIVE symbols means every transition re-sends a list two
+    // messages long, and at that point capping it is a chat-noise decision,
+    // not a protocol limit.
+    uint32_t telegram_active_list_max = 0;
+
     bool verbose = false;
 
-    // Reads --max-symbols=N, --warmup-bars=N, --topics-per-sub=N, --verbose.
+    // Reads --max-symbols=N, --warmup-bars=N, --topics-per-sub=N,
+    // --telegram, --env-file=PATH, --verbose, plus TELEGRAM_BOT_TOKEN /
+    // TELEGRAM_CHAT_ID from `.env` and the environment.
     // nullopt on an unrecognised or malformed flag: the caller refuses to
     // start rather than run with a value the operator did not mean.
     static std::optional<ScreenerConfig> FromArgs(int argc, char* argv[]);
@@ -104,5 +161,23 @@ struct ScreenerConfig {
     // Empty string when the configuration is usable, otherwise the reason.
     std::string Validate() const;
 };
+
+// Applies dotenv CONTENT (not a path) to `config`. Empty return on success,
+// otherwise the reason, naming the line - a typo in a secrets file must stop
+// the run, exactly like an unrecognised flag.
+//
+// Deliberately NOT a dotenv implementation: no variable interpolation, no
+// multi-line values, no `.env.local` layering. It reads `KEY=VALUE`, one per
+// line, with `#` comments, blank lines, an optional `export ` prefix and
+// optional surrounding quotes - which is every .env file anyone actually
+// hand-writes.
+//
+// Keys other than TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are IGNORED, not
+// rejected: a .env is shared with whatever else runs in this directory, and
+// this process has no business failing on another tool's variable.
+//
+// Separate from the file reading so the parsing is testable without a
+// filesystem.
+std::string ApplyDotEnv(std::string_view content, ScreenerConfig& config);
 
 }  // namespace screener

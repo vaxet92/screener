@@ -22,6 +22,7 @@ target_link_libraries(control_manager PUBLIC
     logger
     md_core
     md_provider
+    notifier
     Boost::system
     OpenSSL::SSL
     OpenSSL::Crypto

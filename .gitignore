@@ -23,9 +23,6 @@ compile_commands.json
 .cmake/presets.json
 .cache/
 
-.vscode/
-.claude/
-CLAUDE.md
 
 # Personal interview-prep notes, not part of the shipped project
 docs/DEBRIEF.md
@@ -73,7 +70,6 @@ vcpkg_installed/
 
 # IDE and Editor files
 .vscode/
-.cursor/
 .idea/
 *.swp
 *.swo
@@ -97,3 +93,9 @@ conan.lock
 conanbuildinfo.*
 conaninfo.txt
 graph_info.json
+
+# Secrets - TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Never commit these.
+# .env.example is the template and IS committed.
+.env
+.env.*
+!.env.example
