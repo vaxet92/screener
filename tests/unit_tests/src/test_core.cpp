@@ -64,8 +64,10 @@ std::vector<Candle> FastHistory(uint32_t symbol_id, double close, double recent_
 // are config.json fields (DESIGN.md §15) - keeps every existing test's
 // fixtures and expectations unchanged except where a test explicitly varies
 // a threshold.
-CoreManager MakeCore() { return CoreManager(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
-                                             /*min_natr_bp=*/100, /*min_turnover=*/0); }
+CoreManager MakeCore() {
+    return CoreManager(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
+                       /*min_natr_bp=*/100, /*min_turnover=*/0);
+}
 
 }  // namespace
 
@@ -478,7 +480,7 @@ TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
 // recent-window sum = kFastSurgeWindowBars (288) * 100.0, at kVolumeScale.
 TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
     CoreManager core(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
-                      /*min_natr_bp=*/100, /*min_turnover=*/V(100.0) * kFastSurgeWindowBars + 1);
+                     /*min_natr_bp=*/100, /*min_turnover=*/V(100.0) * kFastSurgeWindowBars + 1);
     core.SetUniverse({"BTCUSDT"});
 
     core.Warmup(0, History(0, 300, 100.0, 1.0));
@@ -497,7 +499,7 @@ TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
 // different period, not a hardcoded one.
 TEST(CoreManager, HonoursARuntimeEmaPeriodOtherThanFifty) {
     CoreManager core(/*ema_period=*/10, /*surge_numerator=*/130, /*surge_denominator=*/100,
-                      /*min_natr_bp=*/100, /*min_turnover=*/0);
+                     /*min_natr_bp=*/100, /*min_turnover=*/0);
     core.SetUniverse({"BTCUSDT"});
 
     // Period 10 on the HTF (4h) needs 10 * 4 = 40 LTF bars to produce a first

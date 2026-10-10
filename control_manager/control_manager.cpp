@@ -122,8 +122,8 @@ void ControlManager::FetchKline(uint32_t symbol_id, TimeFrame tf, KlineHandler d
     std::string target = fmt::format("/v5/market/kline?category=linear&symbol={}&interval={}&limit={}",
                                      core_.NameOf(symbol_id), interval, bars);
 
-    limiter_.AsyncAcquire(
-        [this, symbol_id, tf, interval, target = std::move(target), done = std::move(done)]() mutable {
+    limiter_.AsyncAcquire([this, symbol_id, tf, interval, target = std::move(target),
+                           done = std::move(done)]() mutable {
         Logger::Log(LogLevel::kDebug, "warm-up request sent: {} ({})", core_.NameOf(symbol_id), interval);
 
         AsyncHttpsGet(ioc_, ssl_ctx_, config_.rest_host, config_.rest_port, std::move(target),
@@ -202,8 +202,8 @@ void ControlManager::FinishWarmup() {
     // (DESIGN.md §16) - so warmup_ok_/warmup_done_ count FETCHES, not
     // symbols; {}/{} symbols fully warm is reported separately below from
     // LogWarmupReadiness, which already has the per-symbol view.
-    Logger::Log(LogLevel::kInfo, "warm-up complete: {}/{} fetches ok in {}ms ({} concurrent)", warmup_ok_,
-                warmup_done_, elapsed_ms, kWarmupConcurrency);
+    Logger::Log(LogLevel::kInfo, "warm-up complete: {}/{} fetches ok in {}ms ({} concurrent)", warmup_ok_, warmup_done_,
+                elapsed_ms, kWarmupConcurrency);
 
     if (warmup_ok_ == 0) {
         Logger::Log(LogLevel::kError, "no symbol warmed up - stopping");
@@ -310,13 +310,11 @@ TelegramNotifier::StartupReport ControlManager::LogWarmupReadiness() const {
         // warm-up REQUEST failed, and fast=0 means its 5m one did - two
         // different REST calls (DESIGN.md §16) that can fail independently.
         report.not_ready.push_back(
-            ltf_bars == 0
-                ? fmt::format("{} - no history (1h warm-up request failed)", core_.NameOf(id))
-                : fast_bars == 0
-                      ? fmt::format("{} - no history (5m warm-up request failed)", core_.NameOf(id))
-                      : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h), {} x 5m (needs 576)",
-                                    core_.NameOf(id), ltf_bars, htf_bars, core_.EmaPeriod(), core_.EmaPeriod(),
-                                    fast_bars));
+            ltf_bars == 0 ? fmt::format("{} - no history (1h warm-up request failed)", core_.NameOf(id))
+            : fast_bars == 0
+                ? fmt::format("{} - no history (5m warm-up request failed)", core_.NameOf(id))
+                : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h), {} x 5m (needs 576)", core_.NameOf(id),
+                              ltf_bars, htf_bars, core_.EmaPeriod(), core_.EmaPeriod(), fast_bars));
         // kWarning rather than kDebug, because this is the quiet failure mode
         // of the whole system: a not-ready symbol can never go ACTIVE, so it
         // vanishes from the output with no error anywhere. At ~800 symbols the

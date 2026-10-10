@@ -53,8 +53,8 @@ class CoreManager {
     //   min_natr_bp         - NATR floor, in basis points
     //   min_turnover        - liquidity floor, at kVolumeScale, on the same
     //                         recent-window sum the surge condition reads
-    explicit CoreManager(uint32_t ema_period, int64_t surge_numerator, int64_t surge_denominator,
-                         int32_t min_natr_bp, Volume min_turnover) noexcept
+    explicit CoreManager(uint32_t ema_period, int64_t surge_numerator, int64_t surge_denominator, int32_t min_natr_bp,
+                         Volume min_turnover) noexcept
         : ema_period_(ema_period),
           surge_numerator_(surge_numerator),
           surge_denominator_(surge_denominator),
