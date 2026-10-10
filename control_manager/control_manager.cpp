@@ -93,33 +93,41 @@ bool ControlManager::FetchUniverse(std::vector<Symbol>& out) {
     return !out.empty();
 }
 
-bool ControlManager::ApplyKlineBody(uint32_t symbol_id, const std::string& body) {
+bool ControlManager::ApplyKlineBody(uint32_t symbol_id, TimeFrame tf, const std::string& body) {
     warmup_scratch_.clear();
-    if (!rest_parser_.ParseRestKline(body, symbol_id, warmup_scratch_)) {
+    if (!rest_parser_.ParseRestKline(body, symbol_id, tf, warmup_scratch_)) {
         Logger::Log(LogLevel::kError, "kline for {} unparseable", core_.NameOf(symbol_id));
         return false;
     }
 
     // ParseRestKline already reversed Bybit's newest-first ordering, so these
     // are oldest-first - which is what the recursive indicators require.
-    // CoreManager::Warmup resets the symbol, replays them, clears
-    // rebuild_pending_ and re-evaluates.
-    core_.Warmup(symbol_id, warmup_scratch_);
+    // CoreManager::Warmup/WarmupFast resets the relevant state, replays
+    // them, clears the relevant rebuild-pending flag and re-evaluates.
+    if (tf == TimeFrame::kM5) {
+        core_.WarmupFast(symbol_id, warmup_scratch_);
+    } else {
+        core_.Warmup(symbol_id, warmup_scratch_);
+    }
     return true;
 }
 
-void ControlManager::FetchKline(uint32_t symbol_id, KlineHandler done) {
-    // interval=60 ONLY. The 4h history is built from these bars by the same
-    // aggregator that builds it live, so there is no interval=240 request and
-    // no second code path for warm-up and live HTF bars to disagree across.
-    std::string target = fmt::format("/v5/market/kline?category=linear&symbol={}&interval=60&limit={}",
-                                     core_.NameOf(symbol_id), config_.warmup_ltf_bars);
+void ControlManager::FetchKline(uint32_t symbol_id, TimeFrame tf, KlineHandler done) {
+    // interval=60 for the LTF, interval=5 for the fast stream (DESIGN.md
+    // §16) - never interval=240: the HTF history is built from the LTF bars
+    // by the same aggregator that builds it live, so there is no second code
+    // path for warm-up and live HTF bars to disagree across.
+    const char* interval = tf == TimeFrame::kM5 ? "5" : "60";
+    const uint32_t bars = tf == TimeFrame::kM5 ? config_.warmup_fast_bars : config_.warmup_ltf_bars;
+    std::string target = fmt::format("/v5/market/kline?category=linear&symbol={}&interval={}&limit={}",
+                                     core_.NameOf(symbol_id), interval, bars);
 
-    limiter_.AsyncAcquire([this, symbol_id, target = std::move(target), done = std::move(done)]() mutable {
-        Logger::Log(LogLevel::kDebug, "warm-up request sent: {}", core_.NameOf(symbol_id));
+    limiter_.AsyncAcquire(
+        [this, symbol_id, tf, interval, target = std::move(target), done = std::move(done)]() mutable {
+        Logger::Log(LogLevel::kDebug, "warm-up request sent: {} ({})", core_.NameOf(symbol_id), interval);
 
         AsyncHttpsGet(ioc_, ssl_ctx_, config_.rest_host, config_.rest_port, std::move(target),
-                      [this, symbol_id, done = std::move(done)](std::optional<std::string> body) {
+                      [this, symbol_id, tf, done = std::move(done)](std::optional<std::string> body) {
                           if (body) {
                               Logger::Log(LogLevel::kDebug, "warm-up response received: {} ({} bytes)",
                                           core_.NameOf(symbol_id), body->size());
@@ -131,7 +139,7 @@ void ControlManager::FetchKline(uint32_t symbol_id, KlineHandler done) {
                               Logger::Log(LogLevel::kWarning, "warm-up response FAILED: {}", core_.NameOf(symbol_id));
                           }
 
-                          const bool ok = body.has_value() && ApplyKlineBody(symbol_id, *body);
+                          const bool ok = body.has_value() && ApplyKlineBody(symbol_id, tf, *body);
                           done(ok);
                       });
     });
@@ -139,16 +147,29 @@ void ControlManager::FetchKline(uint32_t symbol_id, KlineHandler done) {
 
 void ControlManager::StartWarmup() {
     warmup_started_ = std::chrono::steady_clock::now();
-    Logger::Log(LogLevel::kInfo, "warm-up starting: {} symbols, {} bars each, {} concurrent", core_.SymbolCount(),
-                config_.warmup_ltf_bars, kWarmupConcurrency);
+    Logger::Log(LogLevel::kInfo, "warm-up starting: {} symbols, {} x 1h + {} x 5m bars each, {} concurrent",
+                core_.SymbolCount(), config_.warmup_ltf_bars, config_.warmup_fast_bars, kWarmupConcurrency);
     PumpWarmup();
 }
 
 void ControlManager::PumpWarmup() {
-    while (warmup_in_flight_ < kWarmupConcurrency && warmup_next_id_ < core_.SymbolCount()) {
-        const uint32_t id = warmup_next_id_++;
+    while (warmup_in_flight_ < kWarmupConcurrency) {
+        // The LTF cursor drains first, then the fast one - order does not
+        // matter for correctness (each is a full Reset()+replay into its own
+        // state), only that both eventually run for every symbol.
+        TimeFrame tf;
+        uint32_t id;
+        if (warmup_next_id_ < core_.SymbolCount()) {
+            tf = TimeFrame::kH1;
+            id = warmup_next_id_++;
+        } else if (warmup_fast_next_id_ < core_.SymbolCount()) {
+            tf = TimeFrame::kM5;
+            id = warmup_fast_next_id_++;
+        } else {
+            break;
+        }
         ++warmup_in_flight_;
-        FetchKline(id, [this](bool ok) { OnWarmupDone(ok); });
+        FetchKline(id, tf, [this](bool ok) { OnWarmupDone(ok); });
     }
 }
 
@@ -159,12 +180,12 @@ void ControlManager::OnWarmupDone(bool ok) {
         ++warmup_ok_;
     }
 
+    const std::size_t total = 2 * core_.SymbolCount();
     if (warmup_done_ % 100 == 0) {
-        Logger::Log(LogLevel::kInfo, "warm-up {}/{} ({} buffered)", warmup_done_, core_.SymbolCount(),
-                    startup_buffer_.size());
+        Logger::Log(LogLevel::kInfo, "warm-up {}/{} ({} buffered)", warmup_done_, total, startup_buffer_.size());
     }
 
-    if (warmup_done_ == core_.SymbolCount()) {
+    if (warmup_done_ == total) {
         FinishWarmup();
         return;
     }
@@ -176,12 +197,13 @@ void ControlManager::FinishWarmup() {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - warmup_started_)
             .count();
 
-    // Wall time and request count are on the measurement list: fetching LTF
-    // only is one request per symbol instead of two, but ~603 bars of JSON
-    // per symbol is more BYTES than a 48+200 split would have been. That
-    // trade is the thing worth measuring rather than asserting.
-    Logger::Log(LogLevel::kInfo, "warm-up complete: {}/{} symbols in {}ms ({} requests, {} concurrent)", warmup_ok_,
-                core_.SymbolCount(), elapsed_ms, warmup_done_, kWarmupConcurrency);
+    // Wall time and request count are on the measurement list. Two REST
+    // requests per symbol now, not one - the fast stream's own warm-up
+    // (DESIGN.md §16) - so warmup_ok_/warmup_done_ count FETCHES, not
+    // symbols; {}/{} symbols fully warm is reported separately below from
+    // LogWarmupReadiness, which already has the per-symbol view.
+    Logger::Log(LogLevel::kInfo, "warm-up complete: {}/{} fetches ok in {}ms ({} concurrent)", warmup_ok_,
+                warmup_done_, elapsed_ms, kWarmupConcurrency);
 
     if (warmup_ok_ == 0) {
         Logger::Log(LogLevel::kError, "no symbol warmed up - stopping");
@@ -217,7 +239,7 @@ void ControlManager::FinishWarmup() {
     // kNext and is applied. That is the whole reconciliation.
     Logger::Log(LogLevel::kInfo, "replaying {} buffered candle(s)", startup_buffer_.size());
     for (const Candle& c : startup_buffer_) {
-        core_.ApplyCandle(c);
+        DispatchCandle(c);
     }
     startup_buffer_.clear();
     startup_buffer_.shrink_to_fit();
@@ -257,6 +279,7 @@ TelegramNotifier::StartupReport ControlManager::LogWarmupReadiness() const {
         const SymbolTracker& s = core_.TrackerAt(id);
         const uint32_t ltf_bars = s.Ltf().Bars();
         const uint32_t htf_bars = s.Htf().Bars();
+        const uint32_t fast_bars = s.Fast().Bars();
         const CoreManager::Conditions c = core_.EvaluateConditions(id);
 
         if (c.ready) {
@@ -268,27 +291,32 @@ TelegramNotifier::StartupReport ControlManager::LogWarmupReadiness() const {
 
             // The per-condition breakdown, not just "READY". "0 ACTIVE of 10"
             // is otherwise indistinguishable from a broken filter, and the
-            // three conditions are ANDed - so knowing WHICH one rejects a
-            // symbol is the difference between "the market is quiet" and "the
-            // surge comparison has its operands the wrong way round".
+            // conditions are ANDed - so knowing WHICH one rejects a symbol is
+            // the difference between "the market is quiet" and "the surge
+            // comparison has its operands the wrong way round".
             Logger::Log(LogLevel::kDebug,
-                        "{}: warm-up complete, READY (ltf={} bars, htf={} bars) surge={} trend={} vol={} -> {}",
-                        core_.NameOf(id), ltf_bars, htf_bars, c.surge, c.trend, c.volatility,
+                        "{}: warm-up complete, READY (ltf={} bars, htf={} bars, fast={} bars) surge={} trend={} "
+                        "vol={} -> {}",
+                        core_.NameOf(id), ltf_bars, htf_bars, fast_bars, c.surge, c.trend, c.volatility,
                         c.All() ? "ACTIVE" : "inactive");
             continue;
         }
 
         ++not_ready;
 
-        // The REASON, per symbol, not just the count. Two causes look
-        // identical in a bare number and are not remotely the same problem:
-        // a brand-new listing genuinely has no history, while ltf=0 means its
-        // warm-up REQUEST failed and the symbol is missing for a reason we
-        // could fix.
+        // The REASON, per symbol, not just the count. Causes look identical
+        // in a bare number and are not remotely the same problem: a
+        // brand-new listing genuinely has no history, ltf=0 means its 1h
+        // warm-up REQUEST failed, and fast=0 means its 5m one did - two
+        // different REST calls (DESIGN.md §16) that can fail independently.
         report.not_ready.push_back(
-            ltf_bars == 0 ? fmt::format("{} - no history (warm-up request failed)", core_.NameOf(id))
-                          : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h)", core_.NameOf(id), ltf_bars,
-                                        htf_bars, core_.EmaPeriod(), core_.EmaPeriod()));
+            ltf_bars == 0
+                ? fmt::format("{} - no history (1h warm-up request failed)", core_.NameOf(id))
+                : fast_bars == 0
+                      ? fmt::format("{} - no history (5m warm-up request failed)", core_.NameOf(id))
+                      : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h), {} x 5m (needs 576)",
+                                    core_.NameOf(id), ltf_bars, htf_bars, core_.EmaPeriod(), core_.EmaPeriod(),
+                                    fast_bars));
         // kWarning rather than kDebug, because this is the quiet failure mode
         // of the whole system: a not-ready symbol can never go ACTIVE, so it
         // vanishes from the output with no error anywhere. At ~800 symbols the
@@ -319,8 +347,19 @@ void ControlManager::OnCandle(const Candle& c) {
         return;
     }
 
-    core_.ApplyCandle(c);
+    DispatchCandle(c);
     PostRebuildDrain();
+}
+
+void ControlManager::DispatchCandle(const Candle& c) {
+    // The only place that reads Candle::timeframe to choose an entry point.
+    // CoreManager itself never inspects it - ApplyCandle and ApplyFastCandle
+    // are told which stream they are, not asked to figure it out.
+    if (c.timeframe == TimeFrame::kM5) {
+        core_.ApplyFastCandle(c);
+    } else {
+        core_.ApplyCandle(c);
+    }
 }
 
 void ControlManager::PostRebuildDrain() {
@@ -355,7 +394,7 @@ void ControlManager::DrainRebuilds() {
     const std::vector<uint32_t> pending = core_.TakePendingRebuilds();
     for (const uint32_t id : pending) {
         Logger::Log(LogLevel::kWarning, "rebuilding {}", core_.NameOf(id));
-        FetchKline(id, [this, id](bool ok) {
+        FetchKline(id, TimeFrame::kH1, [this, id](bool ok) {
             if (!ok) {
                 // NOTE: rebuild_pending_ stays set, so this symbol's bars
                 // keep being dropped rather than applied to known-wrong
@@ -364,6 +403,20 @@ void ControlManager::DrainRebuilds() {
                 // it and the symbol never recovers. Pre-existing; needs a
                 // CoreManager::ClearRebuildPending to fix properly.
                 Logger::Log(LogLevel::kError, "rebuild failed for {} - stays INACTIVE", core_.NameOf(id));
+            }
+        });
+    }
+
+    // The 5m stream's gap rebuild - a SEPARATE list, drained the same way,
+    // since a 1h gap and a 5m gap on the same symbol must not block each
+    // other (DESIGN.md §16).
+    const std::vector<uint32_t> pending_fast = core_.TakePendingFastRebuilds();
+    for (const uint32_t id : pending_fast) {
+        Logger::Log(LogLevel::kWarning, "fast-rebuilding {}", core_.NameOf(id));
+        FetchKline(id, TimeFrame::kM5, [this, id](bool ok) {
+            if (!ok) {
+                Logger::Log(LogLevel::kError, "fast rebuild failed for {} - surge/liquidity stay not-ready",
+                            core_.NameOf(id));
             }
         });
     }

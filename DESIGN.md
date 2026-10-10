@@ -1446,3 +1446,113 @@ malformed explicit file is fatal) — same split as the `.env` tests, for the sa
 the parser's failure modes are tested on content, and the file-reading policy needs a real
 temporary file to observe. `Conditions.liquidity` and the de-templated `Ema` are untested
 until the `[DRILL]` pieces above land.
+
+---
+
+## 16. 5-minute fast re-check — **[open question / not implemented]**
+
+**Proposed, not approved.** This section records a design discussed on 2026-10-10; nothing
+below exists in code. It is a deliberate reversal of §1's framing ("a decision is due
+within milliseconds of an hourly close, not microseconds of a tick") — worth stating
+plainly if it is built, not quietly dropped from the debrief.
+
+### Motivation
+
+The MVP activates/deactivates once per closed 1h bar. Turnover and price are both
+available far more often than that (Bybit's unconfirmed kline updates, or a 5m kline, both
+update within the current hour), so a symbol that would clearly pass the filter can sit
+`INACTIVE` for up to 59 minutes after the condition becomes true. The proposal re-evaluates
+two of the four conditions more often, without touching the recursive indicators that must
+only ever see closed bars.
+
+### What changes and what does not
+
+| Condition | Source | Change |
+|---|---|---|
+| **surge** | turnover window | **moves** from a 48×1h window to a 576×5m window (24h recent + 24h prev at 5m granularity) |
+| **liquidity** | same turnover window as surge (§15) | follows surge — same window, same move |
+| **trend** | 1h close vs HTF EMA50 | price leg reads the **latest closed 5m bar's close** instead of waiting for the 1h close; **EMA50 itself is untouched**, still updates only on HTF (4h) close |
+| **volatility (NATR)** | Wilder ATR(14) on 1h | **unchanged** — stays hourly, read-only, no 5m involvement |
+| **ready** | per-indicator readiness | gains a fourth readiness flag, for the 5m turnover window |
+
+The two conditions that move are exactly the two that are plain reads/sums (`Turnover()`,
+`LastClose()`), never the two backed by a true recursive recursion (`GetEma`, `GetNatrBp`).
+That is not a coincidence — it is why this is tractable without touching §6's "recursive
+state can never see a partial bar" rule at all. **No unconfirmed (`confirm=false`) tick is
+read anywhere in this design** — the 5m bar is a normal `confirm=true` closed candle on a
+second topic, so the existing confirm-gate invariant (§8) is untouched, not weakened.
+
+### New subscription and timeframe
+
+```cpp
+enum class TimeFrame : uint8_t { kLtf1h = 0, kHtf4h = 1, kFastTf5m = 2, kCount = 3 };
+```
+
+A second WS topic, `kline.5.{SYMBOL}`, batched and paced alongside the existing
+`kline.60.{SYMBOL}` subscribe. This **roughly doubles the topic count** on the one
+connection (§8's open question 3 — the per-connection topic ceiling for `linear` is already
+`[unverified]`; doubling it is the first thing to re-measure, not assume).
+
+`SymbolTracker` gains a third tracker-like owner, but **it is not a full `CandleTracker`**:
+it owns only the turnover window (576×5m), nothing else — there is no ATR or EMA on this
+timeframe, so it doesn't fit `CandleTracker::MakeLtf()`/`MakeHtf()`'s existing
+`Use` bitmask cleanly and needs either a third factory or a narrower type. Open question,
+not decided.
+
+### Filter evaluation triggers
+
+`Evaluate(s)` (§6) currently runs once, after `ApplyLtf`. It needs to also run after a
+closed 5m bar, reading whatever is freshest:
+
+```cpp
+void CoreManager::ApplyFastCandle(const Candle& c) {
+    ... dedup/gap on the 5m stream, same Classify() machinery ...
+    s.ApplyFast(c);          // updates ONLY the 5m turnover window
+    Evaluate(s);             // surge/liquidity fresh; trend's price leg fresh; NATR untouched
+}
+```
+
+This reuses §6's "`Get()` returns a value, thresholds live in `CoreManager`" shape —
+`Evaluate` does not need to know which timeframe just closed, only which values are ready.
+
+### Warm-up
+
+A **second** REST call per symbol, `interval=5`, sized the same way §7 sized the 1h call:
+576 bars for the two windows, plus the same kind of small alignment pad §7 used for the 1h
+case (exact pad count open — the 5m case has no 4h-boundary alignment problem since nothing
+downstream aggregates it, so the pad may turn out to be 0). This **roughly doubles REST
+warm-up load per symbol** — §7 measured 603 bars/symbol at 17.98 s for 791 symbols; two
+calls per symbol at similar size is the first number to re-measure, not assume will still
+clear comfortably inside the 600/5s budget.
+
+### Gap handling — a lighter rebuild than §7's
+
+§7's existing rule ("a gap invalidates the symbol, full rebuild from REST") exists because
+ATR/EMA are *recursive* — a missing bar can never be patched into recursive state after the
+fact. The 5m turnover window is a **plain sum**, not a recursion, so a gap in the 5m stream
+only needs to invalidate and re-sum that window from REST — it does **not** need to force
+the symbol INACTIVE or touch the 1h/4h trackers at all:
+
+1. A 5m gap sets a separate `fast_rebuild_pending_` flag (distinct from §7's
+   `rebuild_pending_`), so a 1h gap and a 5m gap can be in flight independently without one
+   blocking the other.
+2. While pending, `surge`/`liquidity` are treated as **not ready** (fail closed, not
+   "use the last known sum") — trend/NATR/readiness on the 1h and 4h side are unaffected,
+   so the symbol does not lose its hourly-cadence ACTIVE status over a 5m hiccup unless
+   surge or liquidity was the condition keeping it active.
+3. The refetch is the same `interval=5` REST call as warm-up, re-summed into a fresh
+   window, same idempotent-by-`open_time` reasoning as §7.
+
+This is a real asymmetry worth stating in a debrief: not every gap is a "recursive state is
+now unrecoverable" gap — it depends on what the indicator downstream of it actually is.
+
+### Open questions (not decided, blocking implementation)
+
+1. Exact 5m window size and alignment pad (576 vs 576+pad).
+2. Tracker shape for the 5m turnover-only owner (third `CandleTracker` factory vs a
+   narrower dedicated type) — a DRILL decision, not a SCAFFOLD one, since it's the filter
+   loop's state.
+3. Whether doubling WS topic count forces `symbols_per_conn` partitioning (§8) sooner than
+   expected — needs the same kind of live measurement §12 item 3 already ran once.
+4. Whether `min_turnover` behaviour (§15) should also gain its own fail-closed note during
+   `fast_rebuild_pending_`, since it reads the same window as surge.

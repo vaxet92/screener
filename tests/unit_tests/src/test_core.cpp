@@ -39,6 +39,27 @@ std::vector<Candle> History(uint32_t symbol_id, int count, double close, double 
     return out;
 }
 
+// Same shape as Bar(), spaced by kFastMs instead of kLtfMs. Used with
+// WarmupFast()/ApplyFastCandle() - the independent 5m stream that now feeds
+// surge, liquidity and trend's price leg (DESIGN.md §16).
+Candle FastBar(uint32_t symbol_id, int64_t open_time_ms, double close, double turnover) {
+    return Bar(symbol_id, open_time_ms, close, turnover);
+}
+
+// 2 x kFastSurgeWindowBars (576) 5m bars = the two 24h windows the fast
+// tracker's surge/liquidity read. `recent_turnover` fills the newer half,
+// `prev_turnover` the older half - same shape as the old LTF surge fixtures,
+// just at 5m granularity and on the stream that now owns the window.
+std::vector<Candle> FastHistory(uint32_t symbol_id, double close, double recent_turnover, double prev_turnover) {
+    std::vector<Candle> out;
+    constexpr int kBars = 2 * kFastSurgeWindowBars;
+    for (int i = 0; i < kBars; ++i) {
+        const double turnover = i >= kFastSurgeWindowBars ? recent_turnover : prev_turnover;
+        out.push_back(FastBar(symbol_id, static_cast<int64_t>(i) * kFastMs, close, turnover));
+    }
+    return out;
+}
+
 // Thresholds matching what used to be compile-time constants, now that they
 // are config.json fields (DESIGN.md §15) - keeps every existing test's
 // fixtures and expectations unchanged except where a test explicitly varies
@@ -89,8 +110,24 @@ TEST(CoreManager, BecomesReadyOnceEveryIndicatorHasHistory) {
     // EMA50 on 4h needs 50 HTF bars = 200 LTF bars.
     const auto history = History(0, 300, 100.0, 1.0);
     core.Warmup(0, history);
+    // And the fast turnover window needs its own 576 bars of 5m history
+    // (DESIGN.md §16) - readiness is now ANDed across three streams, not two.
+    core.WarmupFast(0, FastHistory(0, 100.0, 1.0, 1.0));
 
     EXPECT_TRUE(core.EvaluateConditions(0).ready);
+}
+
+// Readiness is per STREAM. The 1h/4h side can be fully warm while the fast
+// side has never been fed at all, and the symbol must still be not ready -
+// this is the regression guard for EvaluateConditions ANDing in fast's
+// Turnover().ready alongside ltf/htf readiness.
+TEST(CoreManager, NotReadyWithoutTheFastStreamEvenIfLtfAndHtfAreWarm) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+
+    EXPECT_FALSE(core.EvaluateConditions(0).ready);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,17 +203,16 @@ TEST(CoreManager, GapForcesTheSymbolInactiveImmediately) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    // Build a state that passes all three conditions, then confirm it is
-    // ACTIVE before the gap.
+    // Build a state that passes every condition, then confirm it is ACTIVE
+    // before the gap. Rising LTF closes keep ATR/EMA warm; the fast fixture
+    // supplies the surge and the trend price leg (DESIGN.md §16) - a high
+    // close that clears whatever EMA50 the rising LTF history produces.
     std::vector<Candle> history;
     for (int i = 0; i < 300; ++i) {
-        // Rising closes keep close > EMA50; the last 24 bars carry much more
-        // turnover than the 24 before them.
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0));
     }
     core.Warmup(0, history);
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
     ASSERT_TRUE(core.TrackerAt(0).IsActive()) << "fixture must be ACTIVE before the gap";
     ASSERT_EQ(core.ActiveInstruments().count("BTCUSDT"), 1u);
 
@@ -239,6 +275,86 @@ TEST(CoreManager, BarsArrivingBeforeTheRebuildAreDroppedAndRecoveredByIt) {
 }
 
 // ---------------------------------------------------------------------------
+// Fast stream (5m) gap handling - DESIGN.md §16
+// ---------------------------------------------------------------------------
+
+TEST(CoreManager, FastGapQueuesAFastRebuildAndDoesNotApplyTheBar) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+    const auto fast_history = FastHistory(0, 100.0, 1.0, 1.0);
+    core.WarmupFast(0, fast_history);
+
+    const uint32_t before = core.TrackerAt(0).Fast().Bars();
+
+    // One 5m period missing: the fixture's last bar opens at
+    // (size-1)*kFastMs, so the next bar is expected at size*kFastMs.
+    const int64_t gap_open_time = (static_cast<int64_t>(fast_history.size()) + 1) * kFastMs;
+    core.ApplyFastCandle(FastBar(0, gap_open_time, 110.0, 1.0));
+
+    EXPECT_EQ(core.TrackerAt(0).Fast().Bars(), 0u) << "ResetFast() fails closed immediately, not just on the next bar";
+    EXPECT_NE(before, 0u) << "sanity: the fixture really had bars before the gap";
+    EXPECT_TRUE(core.TrackerAt(0).FastRebuildPending());
+
+    const auto pending = core.TakePendingFastRebuilds();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(pending[0], 0u);
+    // The 1h rebuild list is untouched - a 5m gap is not a 1h gap.
+    EXPECT_TRUE(core.TakePendingRebuilds().empty());
+}
+
+TEST(CoreManager, ASecondFastGapDoesNotQueueTheSameSymbolTwice) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+    core.WarmupFast(0, FastHistory(0, 100.0, 1.0, 1.0));
+
+    core.ApplyFastCandle(FastBar(0, 600 * kFastMs, 100.0, 1.0));
+    core.ApplyFastCandle(FastBar(0, 604 * kFastMs, 100.0, 1.0));
+
+    EXPECT_EQ(core.TakePendingFastRebuilds().size(), 1u);
+}
+
+// The core of DESIGN.md §16's "lighter rebuild": a 5m gap must NOT touch the
+// 1h/4h trackers, and a 1h gap in flight at the same time must not be
+// affected by it either - the two rebuild paths are fully independent.
+TEST(CoreManager, FastGapDoesNotTouchTheOneHourOrFourHourTrackers) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 100.0, 1.0, 1.0));
+
+    const uint32_t ltf_bars = core.TrackerAt(0).Ltf().Bars();
+    const uint32_t htf_bars = core.TrackerAt(0).Htf().Bars();
+    const Price ema = core.TrackerAt(0).Htf().GetEma();
+
+    core.ApplyFastCandle(FastBar(0, 600 * kFastMs, 110.0, 1.0));  // 5m gap
+
+    EXPECT_EQ(core.TrackerAt(0).Ltf().Bars(), ltf_bars);
+    EXPECT_EQ(core.TrackerAt(0).Htf().Bars(), htf_bars);
+    EXPECT_EQ(core.TrackerAt(0).Htf().GetEma(), ema);
+    // And a live 1h bar still applies normally while the fast rebuild is
+    // pending - the two streams really are independent, not just "don't
+    // crash".
+    core.ApplyCandle(Bar(0, 300 * kLtfMs, 110.0, 1.0));
+    EXPECT_EQ(core.TrackerAt(0).Ltf().Bars(), ltf_bars + 1);
+}
+
+// WarmupFast() must reset and replay ONLY the fast tracker - a regression
+// guard for the same reason Warmup()/Reset() stay separate from it.
+TEST(CoreManager, WarmupFastDoesNotResetLtfOrHtf) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+
+    const uint32_t ltf_bars = core.TrackerAt(0).Ltf().Bars();
+    const uint32_t htf_bars = core.TrackerAt(0).Htf().Bars();
+
+    core.WarmupFast(0, FastHistory(0, 100.0, 1.0, 1.0));
+
+    EXPECT_EQ(core.TrackerAt(0).Ltf().Bars(), ltf_bars);
+    EXPECT_EQ(core.TrackerAt(0).Htf().Bars(), htf_bars);
+}
+
+// ---------------------------------------------------------------------------
 // Apply-before-evaluate ordering
 // ---------------------------------------------------------------------------
 
@@ -276,11 +392,14 @@ TEST(CoreManager, ActivatesWhenAllThreeConditionsHold) {
 
     std::vector<Candle> history;
     for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;                  // rising -> close > EMA50
-        const double turnover = i >= 276 ? 100.0 : 1.0;  // last 24 bars surge
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0));
     }
     core.Warmup(0, history);
+    // Surge and trend's price leg now come from the fast (5m) stream
+    // (DESIGN.md §16): a high close clears whatever EMA50 the rising LTF
+    // history produces, and the recent half of the window carries far more
+    // turnover than the earlier half.
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     const auto c = core.EvaluateConditions(0);
     EXPECT_TRUE(c.ready);
@@ -295,11 +414,10 @@ TEST(CoreManager, FlatTurnoverFailsTheSurgeCondition) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    // Flat turnover on the fast stream: recent == prev, so the surge ratio
+    // never clears 1.30x.
+    core.WarmupFast(0, FastHistory(0, 1000.0, 1.0, 1.0));
 
     const auto c = core.EvaluateConditions(0);
     EXPECT_TRUE(c.ready);
@@ -313,12 +431,8 @@ TEST(CoreManager, SurgeBoundaryIsExclusive) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 1.3 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 1.3, 1.0));
 
     EXPECT_FALSE(core.EvaluateConditions(0).surge);
 }
@@ -329,11 +443,13 @@ TEST(CoreManager, LowVolatilityFailsTheNatrCondition) {
 
     std::vector<Candle> history;
     for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        // 0.1% range: NATR well under the 100bp floor.
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover, 0.1));
+        // 0.1% range: NATR well under the 100bp floor. Volatility is still
+        // read from the LTF's own ATR (DESIGN.md §16 leaves it untouched),
+        // so only this fixture's range matters here.
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0, 0.1));
     }
     core.Warmup(0, history);
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     const auto c = core.EvaluateConditions(0);
     EXPECT_TRUE(c.surge);
@@ -348,13 +464,8 @@ TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     EXPECT_TRUE(core.EvaluateConditions(0).liquidity);
 }
@@ -363,18 +474,15 @@ TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
 // liquidity condition and keep the symbol out of ACTIVE even though
 // surge/trend/volatility all hold - same fixture as
 // ActivatesWhenAllThreeConditionsHold, only the threshold differs.
+//
+// recent-window sum = kFastSurgeWindowBars (288) * 100.0, at kVolumeScale.
 TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
     CoreManager core(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
-                      /*min_natr_bp=*/100, /*min_turnover=*/V(100.0) * 24 + 1);
+                      /*min_natr_bp=*/100, /*min_turnover=*/V(100.0) * kFastSurgeWindowBars + 1);
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;  // recent-window sum = 24 * 100.0
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     const auto c = core.EvaluateConditions(0);
     EXPECT_TRUE(c.surge);
@@ -397,11 +505,10 @@ TEST(CoreManager, HonoursARuntimeEmaPeriodOtherThanFifty) {
     // would leave the default-period fixture `not ready` is enough here.
     std::vector<Candle> history;
     for (int i = 0; i < 80; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 56 ? 100.0 : 1.0;  // last 24 bars surge
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0));
     }
     core.Warmup(0, history);
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     const auto c = core.EvaluateConditions(0);
     EXPECT_TRUE(c.ready);
@@ -413,17 +520,15 @@ TEST(CoreManager, DeactivatesWhenAConditionStopsHolding) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
 
-    // A collapse in close drops it below the EMA50 and kills the trend
-    // condition.
-    core.ApplyCandle(Bar(0, 300 * kLtfMs, 1.0, 100.0));
+    // Trend now reads the FAST stream's last close (DESIGN.md §16), so a
+    // collapse has to arrive on THAT stream, continuing it exactly where
+    // WarmupFast left off, to drop below EMA50 and kill the trend condition.
+    core.ApplyFastCandle(FastBar(0, static_cast<int64_t>(fast_history.size()) * kFastMs, 1.0, 100.0));
 
     EXPECT_FALSE(core.TrackerAt(0).IsActive());
     EXPECT_EQ(core.ActiveInstruments().count("BTCUSDT"), 0u);
@@ -440,13 +545,8 @@ TEST(CoreManager, ActivatingPushesATransition) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
 
     const auto transitions = core.TakeTransitions();
@@ -459,18 +559,15 @@ TEST(CoreManager, DeactivatingPushesATransition) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
     core.TakeTransitions();  // drain the activation from Warmup
 
-    // Collapse in close drops it below the EMA50 and kills the trend
-    // condition.
-    core.ApplyCandle(Bar(0, 300 * kLtfMs, 1.0, 100.0));
+    // Collapse on the fast stream (DESIGN.md §16: trend now reads it) drops
+    // below EMA50 and kills the trend condition.
+    core.ApplyFastCandle(FastBar(0, static_cast<int64_t>(fast_history.size()) * kFastMs, 1.0, 100.0));
     ASSERT_FALSE(core.TrackerAt(0).IsActive());
 
     const auto transitions = core.TakeTransitions();
@@ -483,12 +580,8 @@ TEST(CoreManager, TakeTransitionsDrainsNotServicedInline) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
 
     EXPECT_EQ(core.TakeTransitions().size(), 1u);
     // And the list is now empty - a second drain must not repeat the work.
@@ -501,18 +594,15 @@ TEST(CoreManager, StayingActiveDoesNotPushATransition) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
     core.TakeTransitions();  // drain the activation from Warmup
 
-    // Next bar keeps every condition holding: still rising, still surging.
-    core.ApplyCandle(Bar(0, 300 * kLtfMs, 400.0, 100.0));
+    // Next fast bar keeps every condition holding: still a high close,
+    // still surging.
+    core.ApplyFastCandle(FastBar(0, static_cast<int64_t>(fast_history.size()) * kFastMs, 1000.0, 100.0));
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
 
     EXPECT_TRUE(core.TakeTransitions().empty());
@@ -525,18 +615,39 @@ TEST(CoreManager, GapForcesInactiveAndPushesATransition) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double close = 100.0 + i;
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
     ASSERT_TRUE(core.TrackerAt(0).IsActive());
     core.TakeTransitions();  // drain the activation from Warmup
 
-    core.ApplyCandle(Bar(0, 310 * kLtfMs, 500.0, 500.0));  // gap
+    core.ApplyCandle(Bar(0, 310 * kLtfMs, 500.0, 500.0));  // gap, on the 1h stream
     ASSERT_FALSE(core.TrackerAt(0).IsActive());
+
+    const auto transitions = core.TakeTransitions();
+    ASSERT_EQ(transitions.size(), 1u);
+    EXPECT_EQ(transitions[0].symbol_id, 0u);
+    EXPECT_FALSE(transitions[0].active);
+}
+
+// A gap on the FAST stream must also force INACTIVE and record the edge,
+// even though it bypasses RequestRebuild entirely - RequestFastRebuild fails
+// closed through the normal Evaluate()/TryDeactivate() path instead
+// (DESIGN.md §16), and that path must still produce a transition.
+TEST(CoreManager, FastGapForcesInactiveAndPushesATransition) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+    core.TakeTransitions();  // drain the activation from Warmup
+
+    // One 5m period missing.
+    const int64_t gap_open_time = (static_cast<int64_t>(fast_history.size()) + 1) * kFastMs;
+    core.ApplyFastCandle(FastBar(0, gap_open_time, 1000.0, 100.0));
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+    ASSERT_TRUE(core.TrackerAt(0).FastRebuildPending());
 
     const auto transitions = core.TakeTransitions();
     ASSERT_EQ(transitions.size(), 1u);
@@ -561,12 +672,8 @@ TEST(CoreManager, SetUniverseClearsPendingTransitions) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
-    std::vector<Candle> history;
-    for (int i = 0; i < 300; ++i) {
-        const double turnover = i >= 276 ? 100.0 : 1.0;
-        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
-    }
-    core.Warmup(0, history);
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
     ASSERT_TRUE(core.TrackerAt(0).IsActive());  // transition pending, not yet drained
 
     core.SetUniverse({"BTCUSDT"});
@@ -580,6 +687,7 @@ TEST(CoreManager, SetUniverseClearsPendingTransitions) {
 
 TEST(CoreManager, ReplayIsDeterministic) {
     const auto history = History(0, 300, 100.0, 1.0);
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
 
     CoreManager a = MakeCore();
     CoreManager b = MakeCore();
@@ -587,10 +695,12 @@ TEST(CoreManager, ReplayIsDeterministic) {
     b.SetUniverse({"BTCUSDT"});
     a.Warmup(0, history);
     b.Warmup(0, history);
+    a.WarmupFast(0, fast_history);
+    b.WarmupFast(0, fast_history);
 
     EXPECT_EQ(a.TrackerAt(0).Htf().GetEma(), b.TrackerAt(0).Htf().GetEma());
     EXPECT_EQ(a.TrackerAt(0).Ltf().GetNatrBp(), b.TrackerAt(0).Ltf().GetNatrBp());
-    EXPECT_EQ(a.TrackerAt(0).Ltf().Turnover().recent, b.TrackerAt(0).Ltf().Turnover().recent);
+    EXPECT_EQ(a.TrackerAt(0).Fast().Turnover().recent, b.TrackerAt(0).Fast().Turnover().recent);
 }
 
 TEST(CoreManager, UnknownSymbolIdIsIgnored) {

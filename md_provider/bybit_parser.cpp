@@ -55,12 +55,18 @@ bool BybitParser::ParseKlineFrame(std::string_view raw, const SymbolIdMap& ids, 
         return false;
     }
 
-    // "kline.60.BTCUSDT" -> "BTCUSDT"
-    const auto dot = topic.rfind('.');
-    if (dot == std::string_view::npos) {
+    // "kline.60.BTCUSDT" -> interval "60", symbol "BTCUSDT".
+    // "kline.5.BTCUSDT"  -> interval "5",  symbol "BTCUSDT".
+    const auto first_dot = topic.find('.');
+    const auto last_dot = topic.rfind('.');
+    if (first_dot == std::string_view::npos || last_dot == std::string_view::npos || first_dot == last_dot) {
         return false;
     }
-    const std::string_view symbol = topic.substr(dot + 1);
+    const std::string_view interval = topic.substr(first_dot + 1, last_dot - first_dot - 1);
+    const std::string_view symbol = topic.substr(last_dot + 1);
+    // The only two streams we subscribe to (DESIGN.md §16) - anything else
+    // on a "kline." topic would be a symbol we never asked Bybit for.
+    const TimeFrame tf = interval == "5" ? TimeFrame::kM5 : TimeFrame::kH1;
 
     const auto it = ids.find(symbol);
     if (it == ids.end()) {
@@ -101,6 +107,7 @@ bool BybitParser::ParseKlineFrame(std::string_view raw, const SymbolIdMap& ids, 
         Candle c{};
         c.symbol_id = symbol_id;
         c.event_time_ms = event_time_ms;
+        c.timeframe = tf;
 
         if (bar["start"].get_int64().get(c.open_time_ms)) {
             return false;
@@ -138,7 +145,7 @@ bool BybitParser::ParseKlineFrame(std::string_view raw, const SymbolIdMap& ids, 
     return true;
 }
 
-bool BybitParser::ParseRestKline(std::string_view body, uint32_t symbol_id, std::vector<Candle>& out) {
+bool BybitParser::ParseRestKline(std::string_view body, uint32_t symbol_id, TimeFrame tf, std::vector<Candle>& out) {
     ondemand::document doc;
     if (parser_.iterate(Load(body)).get(doc)) {
         return false;
@@ -185,6 +192,7 @@ bool BybitParser::ParseRestKline(std::string_view body, uint32_t symbol_id, std:
 
         Candle c{};
         c.symbol_id = symbol_id;
+        c.timeframe = tf;
         if (!ParseInt64(fields[0], c.open_time_ms)) {
             return false;
         }

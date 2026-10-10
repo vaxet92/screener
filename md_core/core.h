@@ -7,11 +7,17 @@
 // comparisons that turn a value into a verdict are here, in one place, so
 // changing a threshold never means touching an indicator.
 //
-// THREADING: single thread. The provider calls ApplyCandle() directly from
-// the WebSocket read handler, on the one io_context thread, and that direct
-// call is safe ONLY because there is no other thread. The moment parsing
-// moves off this thread it becomes a data race on every indicator, and the
-// callback must become an SPSC push (DESIGN.md §13, Phase 1 item 10).
+// THREADING: single thread. The provider calls ApplyCandle()/ApplyFastCandle()
+// directly from the WebSocket read handler, on the one io_context thread, and
+// that direct call is safe ONLY because there is no other thread. The moment
+// parsing moves off this thread it becomes a data race on every indicator,
+// and the callback must become an SPSC push (DESIGN.md §13, Phase 1 item 10).
+//
+// Two message-path entry points now, not one: ApplyCandle() for the 1h
+// stream, ApplyFastCandle() for the independent 5m stream that re-checks
+// surge/liquidity/trend's price leg faster than once an hour (DESIGN.md
+// §16). Both still only ever read a value and compare it to a threshold
+// here - neither indicator stream feeds the other.
 
 #include <cstdint>
 #include <span>
@@ -81,12 +87,31 @@ class CoreManager {
     // wrong.
     void Warmup(uint32_t symbol_id, std::span<const Candle> candles);
 
-    // Apply one CLOSED 1h candle. The only entry point on the message path.
+    // Same contract as Warmup(), for the independent 5m stream (DESIGN.md
+    // §16): reset ONLY the fast turnover window, replay `candles`
+    // oldest-first, then re-evaluate. Never touches the 1h/4h trackers - a
+    // 5m gap and a 1h gap are unrelated events.
+    void WarmupFast(uint32_t symbol_id, std::span<const Candle> candles);
+
+    // Apply one CLOSED 1h candle. The main entry point on the message path.
     void ApplyCandle(const Candle& c);
+
+    // Apply one CLOSED 5m candle (DESIGN.md §16). The second entry point on
+    // the message path - routed here by whoever reads Candle::timeframe,
+    // never by this class: CoreManager does not know which WS topic a bar
+    // came from, only which stream it is being told to update.
+    void ApplyFastCandle(const Candle& c);
 
     // Symbols that hit a gap and need a REST rebuild. Drained by the main
     // loop after each frame, never serviced inline - see RequestRebuild().
     std::vector<uint32_t> TakePendingRebuilds();
+
+    // Same contract, for a gap on the 5m stream - see RequestFastRebuild().
+    // Kept as a SEPARATE list from TakePendingRebuilds(): a 1h rebuild
+    // refetches ~600 bars for the whole symbol, a fast rebuild refetches
+    // ~576 5m bars for the turnover window alone, and the two must be able
+    // to proceed independently.
+    std::vector<uint32_t> TakePendingFastRebuilds();
 
     // One ACTIVE/INACTIVE edge. `active` is the state the symbol just
     // entered, not merely "something changed" - the notifier formats a
@@ -117,7 +142,10 @@ class CoreManager {
     void ApplyCandleComplete(SymbolTracker& s, TimeFrame frame);
 
     void Evaluate(SymbolTracker& s);
-    void TryActivate(SymbolTracker& s, const Conditions& c);
+    // No Conditions parameter: every condition is true by construction at
+    // every call site (Evaluate() only calls this when c.All() holds), so
+    // there is nothing left for this function to read from it.
+    void TryActivate(SymbolTracker& s);
     void TryDeactivate(SymbolTracker& s, const Conditions& c);
 
     // Record the symbol for a later rebuild and return.
@@ -129,6 +157,14 @@ class CoreManager {
     // Recording the id and letting the main loop drain it afterwards costs a
     // push_back and removes the re-entrancy entirely.
     void RequestRebuild(SymbolTracker& s);
+
+    // Lighter than RequestRebuild(): resets ONLY the fast turnover window
+    // (fail closed - surge/liquidity/ready go false through the normal
+    // Evaluate() path below, not through a forced bypass) and queues a
+    // re-fetch. Never touches is_active_ directly and never touches the
+    // 1h/4h trackers. See DESIGN.md §16 for why a 5m gap does not need
+    // RequestRebuild's full, forced-INACTIVE treatment.
+    void RequestFastRebuild(SymbolTracker& s);
 
     const uint32_t ema_period_;
     const int64_t surge_numerator_;
@@ -146,6 +182,7 @@ class CoreManager {
     std::unordered_set<Symbol> active_instruments_;
 
     std::vector<uint32_t> pending_rebuilds_;
+    std::vector<uint32_t> pending_fast_rebuilds_;
     std::vector<Transition> pending_transitions_;
 };
 

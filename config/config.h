@@ -62,6 +62,16 @@ struct ScreenerConfig {
     // cannot disagree.
     uint32_t warmup_ltf_bars = 603;
 
+    // 5m bars to fetch per symbol at startup, for the independent fast
+    // turnover window (DESIGN.md §16, not yet wired end to end).
+    //
+    // Sized by the window itself: 288 bars of 5m candles is 24h, and the
+    // surge/liquidity conditions need two adjacent 24h windows, so 576.
+    // Unlike warmup_ltf_bars there is no alignment pad to add - nothing
+    // downstream aggregates these bars into a larger bucket, so there is no
+    // leading partial group to protect against.
+    uint32_t warmup_fast_bars = 576;
+
     // ---- Liveness ---------------------------------------------------------
 
     // Client ping interval. Bybit expects a {"op":"ping"} within 20s or it

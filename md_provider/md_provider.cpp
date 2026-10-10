@@ -48,9 +48,12 @@ void BybitProvider::Start(const std::vector<Symbol>& symbols) {
     for (uint32_t id = 0; id < symbols.size(); ++id) {
         ids_.emplace(symbols[id], id);
         // Bybit topic naming: kline.{interval}.{SYMBOL}, interval in MINUTES
-        // as a bare number ("60", not "1h"), symbol uppercase. We subscribe
-        // to the LTF only - the 4h is aggregated locally.
+        // as a bare number ("60", not "1h"), symbol uppercase. The 4h is
+        // still aggregated locally - never subscribed - but the 5m fast
+        // re-check stream (DESIGN.md §16) IS a second subscription, which
+        // roughly doubles the topic count on this one connection.
         topics_.push_back(fmt::format("kline.60.{}", symbols[id]));
+        topics_.push_back(fmt::format("kline.5.{}", symbols[id]));
     }
 
     stopped_ = false;

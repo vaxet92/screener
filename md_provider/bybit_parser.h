@@ -50,13 +50,15 @@ class BybitParser : public Parser {
     // frame for a symbol we do not track is not an error.
     bool ParseKlineFrame(std::string_view raw, const SymbolIdMap& ids, std::vector<Candle>& out);
 
-    // /v5/market/kline. Appends candles OLDEST-FIRST.
+    // /v5/market/kline. Appends candles OLDEST-FIRST, tagged `tf` (the
+    // interval this particular request asked for - the response body itself
+    // does not carry it back).
     //
     // Bybit returns `result.list` NEWEST-FIRST, so this reverses it. Feeding
     // the rows as received runs the recursive indicators backwards and
     // produces values that look plausible and are wrong - which is why this
     // reversal lives here, once, rather than at each call site.
-    bool ParseRestKline(std::string_view body, uint32_t symbol_id, std::vector<Candle>& out);
+    bool ParseRestKline(std::string_view body, uint32_t symbol_id, TimeFrame tf, std::vector<Candle>& out);
 
     // /v5/market/instruments-info. Appends the symbols of every
     // LinearPerpetual with status "Trading" and quoteCoin "USDT".

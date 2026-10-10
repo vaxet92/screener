@@ -19,12 +19,13 @@ SymbolIdMap Ids() {
 // A real-shaped Bybit v5 linear kline frame. `start`/`end`/`timestamp` are
 // NUMBERS and the prices are STRINGS - which is the opposite of the REST
 // shape, and exactly the kind of thing that belongs pinned in a test.
-std::string KlineFrame(const char* symbol, int64_t start, bool confirm, const char* close, const char* turnover) {
-    return std::string(R"({"topic":"kline.60.)") + symbol + R"(","data":[{"start":)" + std::to_string(start) +
-           R"(,"end":)" + std::to_string(start + 3'599'999) + R"(,"interval":"60","open":"100.5","close":")" + close +
-           R"(","high":"110.25","low":"99.5","volume":"123.45","turnover":")" + turnover + R"(","confirm":)" +
-           (confirm ? "true" : "false") + R"(,"timestamp":)" + std::to_string(start + 1000) + R"(}],"ts":)" +
-           std::to_string(start + 3'600'000) + R"(,"type":"snapshot"})";
+std::string KlineFrame(const char* symbol, int64_t start, bool confirm, const char* close, const char* turnover,
+                       const char* interval = "60") {
+    return std::string(R"({"topic":"kline.)") + interval + "." + symbol + R"(","data":[{"start":)" +
+           std::to_string(start) + R"(,"end":)" + std::to_string(start + 3'599'999) + R"(,"interval":")" + interval +
+           R"(","open":"100.5","close":")" + close + R"(","high":"110.25","low":"99.5","volume":"123.45","turnover":")" +
+           turnover + R"(","confirm":)" + (confirm ? "true" : "false") + R"(,"timestamp":)" +
+           std::to_string(start + 1000) + R"(}],"ts":)" + std::to_string(start + 3'600'000) + R"(,"type":"snapshot"})";
 }
 
 }  // namespace
@@ -64,6 +65,23 @@ TEST(BybitParser, ParsesAConfirmedBar) {
     EXPECT_EQ(c.high, static_cast<Price>(110.25 * static_cast<double>(kPriceScale)));
     EXPECT_EQ(c.low, static_cast<Price>(99.5 * static_cast<double>(kPriceScale)));
     EXPECT_EQ(c.close, static_cast<Price>(105.75 * static_cast<double>(kPriceScale)));
+    EXPECT_EQ(c.timeframe, TimeFrame::kH1) << "kline.60. must tag the LTF timeframe";
+}
+
+// The fast re-check stream (DESIGN.md §16): a "kline.5." topic must tag the
+// candle kM5, which is what lets ControlManager::DispatchCandle route it to
+// ApplyFastCandle instead of ApplyCandle without CoreManager ever looking at
+// a WS topic itself.
+TEST(BybitParser, TagsTheFastStreamFromItsTopic) {
+    BybitParser parser;
+    const auto ids = Ids();
+    std::vector<Candle> out;
+
+    ASSERT_TRUE(
+        parser.ParseKlineFrame(KlineFrame("BTCUSDT", 1'700'000'000'000, true, "105", "1", "5"), ids, out));
+
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].timeframe, TimeFrame::kM5);
 }
 
 // Act on closed bars only. An unconfirmed bar is the in-progress hour,
@@ -170,7 +188,7 @@ TEST(BybitParser, RestKlineComesOutOldestFirst) {
                              R"(["3600000","20","21","19","20.5","1","200"],)"
                              R"(["0","10","11","9","10.5","1","100"]]}})";
 
-    ASSERT_TRUE(parser.ParseRestKline(body, 5, out));
+    ASSERT_TRUE(parser.ParseRestKline(body, 5, TimeFrame::kH1, out));
     ASSERT_EQ(out.size(), 3u);
 
     EXPECT_EQ(out[0].open_time_ms, 0);
@@ -178,6 +196,7 @@ TEST(BybitParser, RestKlineComesOutOldestFirst) {
     EXPECT_EQ(out[2].open_time_ms, 7'200'000);
 
     EXPECT_EQ(out[0].symbol_id, 5u);
+    EXPECT_EQ(out[0].timeframe, TimeFrame::kH1);
     EXPECT_EQ(out[0].open, static_cast<Price>(10.0 * static_cast<double>(kPriceScale)));
     EXPECT_EQ(out[0].high, static_cast<Price>(11.0 * static_cast<double>(kPriceScale)));
     EXPECT_EQ(out[0].low, static_cast<Price>(9.0 * static_cast<double>(kPriceScale)));
@@ -198,17 +217,32 @@ TEST(BybitParser, RestKlineReverseOnlyTouchesItsOwnAppend) {
     const std::string body =
         R"({"retCode":0,"result":{"list":[["3600000","2","2","2","2","1","2"],["0","1","1","1","1","1","1"]]}})";
 
-    ASSERT_TRUE(parser.ParseRestKline(body, 0, out));
+    ASSERT_TRUE(parser.ParseRestKline(body, 0, TimeFrame::kH1, out));
     ASSERT_EQ(out.size(), 3u);
     EXPECT_EQ(out[0].open_time_ms, -1) << "the pre-existing element must not move";
     EXPECT_EQ(out[1].open_time_ms, 0);
     EXPECT_EQ(out[2].open_time_ms, 3'600'000);
 }
 
+// The REST response body carries no interval field back, so the caller's
+// requested `tf` is what tags every row - this is the regression guard for
+// ControlManager::FetchKline asking for interval=5 and getting kM5-tagged
+// Candles back out of ApplyKlineBody.
+TEST(BybitParser, RestKlineTagsTheRequestedTimeframe) {
+    BybitParser parser;
+    std::vector<Candle> out;
+
+    const std::string body = R"({"retCode":0,"result":{"list":[["0","1","1","1","1","1","1"]]}})";
+
+    ASSERT_TRUE(parser.ParseRestKline(body, 0, TimeFrame::kM5, out));
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].timeframe, TimeFrame::kM5);
+}
+
 TEST(BybitParser, RestKlineRejectsNonZeroRetCode) {
     BybitParser parser;
     std::vector<Candle> out;
-    EXPECT_FALSE(parser.ParseRestKline(R"({"retCode":10006,"retMsg":"too frequent","result":{}})", 0, out));
+    EXPECT_FALSE(parser.ParseRestKline(R"({"retCode":10006,"retMsg":"too frequent","result":{}})", 0, TimeFrame::kH1, out));
 }
 
 // ---------------------------------------------------------------------------
