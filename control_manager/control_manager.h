@@ -90,16 +90,26 @@ class ControlManager {
     // ---- Shared REST path -------------------------------------------------
 
     // One async kline request for one symbol, paced through the limiter.
-    // Used by both warm-up and rebuild: same endpoint, same parse, same
-    // CoreManager::Warmup replay, so the two can never disagree.
-    void FetchKline(uint32_t symbol_id, KlineHandler done);
+    // Used by warm-up AND both rebuild paths: same endpoint, same parse,
+    // same CoreManager::Warmup/WarmupFast replay, so none of them can ever
+    // disagree. `tf` selects interval=60 (LTF) or interval=5 (the fast
+    // stream, DESIGN.md §16) and therefore which CoreManager replay runs.
+    void FetchKline(uint32_t symbol_id, TimeFrame tf, KlineHandler done);
 
-    bool ApplyKlineBody(uint32_t symbol_id, const std::string& body);
+    bool ApplyKlineBody(uint32_t symbol_id, TimeFrame tf, const std::string& body);
 
-    // Drains CoreManager's pending-rebuild list. Posted to the io_context by
-    // the candle callback, never called from inside it - a rebuild replays
-    // ~600 bars through the warm-up path, and doing that from inside
-    // ApplyCandle would re-enter the state that call is still reading.
+    // Routes one live candle to CoreManager by which stream it closed on.
+    // CoreManager has two entry points and no opinion about WS topics; this
+    // is the one place that turns Candle::timeframe into a choice between
+    // them. Shared by OnCandle (live) and FinishWarmup's startup-buffer
+    // replay, so the two can never disagree about the routing either.
+    void DispatchCandle(const Candle& c);
+
+    // Drains CoreManager's pending-rebuild lists (1h AND 5m). Posted to the
+    // io_context by the candle callback, never called from inside it - a
+    // rebuild replays history through the warm-up path, and doing that from
+    // inside ApplyCandle/ApplyFastCandle would re-enter the state that call
+    // is still reading.
     void DrainRebuilds();
 
     void PostRebuildDrain();
@@ -154,7 +164,13 @@ class ControlManager {
 
     bool warmed_up_ = false;
 
+    // Two independent cursors into the same symbol range: every symbol needs
+    // ONE interval=60 fetch and ONE interval=5 fetch (DESIGN.md §16), and
+    // PumpWarmup drains the LTF cursor before starting the fast one. Total
+    // work is therefore 2 * SymbolCount(), which is what warmup_done_ is
+    // compared against.
     uint32_t warmup_next_id_ = 0;
+    uint32_t warmup_fast_next_id_ = 0;
     std::size_t warmup_in_flight_ = 0;
     std::size_t warmup_done_ = 0;
     std::size_t warmup_ok_ = 0;

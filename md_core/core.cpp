@@ -9,6 +9,7 @@ void CoreManager::SetUniverse(const std::vector<Symbol>& symbols) {
     id_by_symbol_.clear();
     active_instruments_.clear();
     pending_rebuilds_.clear();
+    pending_fast_rebuilds_.clear();
     pending_transitions_.clear();
 
     // reserve() before the loop matters more than it looks: SymbolTracker
@@ -52,6 +53,23 @@ void CoreManager::Warmup(uint32_t symbol_id, std::span<const Candle> candles) {
     // its next live bar: it was forced INACTIVE when the gap was seen, and
     // without this it would stay INACTIVE for up to an hour after its state
     // is already correct again.
+    Evaluate(s);
+}
+
+void CoreManager::WarmupFast(uint32_t symbol_id, std::span<const Candle> candles) {
+    SymbolTracker& s = state_[symbol_id];
+
+    // ResetFast(), not Reset(): the turnover window is a plain sum, not a
+    // recursive indicator, and this stream is independent of the 1h/4h
+    // trackers. Touching them here would re-evaluate a gap that did not
+    // happen on them.
+    s.ResetFast();
+
+    for (const Candle& c : candles) {
+        s.ApplyFast(c);
+    }
+
+    s.SetFastRebuildPending(false);
     Evaluate(s);
 }
 
@@ -104,6 +122,36 @@ void CoreManager::ApplyCandle(const Candle& c) {
     Evaluate(s);
 }
 
+void CoreManager::ApplyFastCandle(const Candle& c) {
+    if (c.symbol_id >= state_.size()) {
+        Logger::Log(LogLevel::kError, "ApplyFastCandle: unknown symbol_id {}", c.symbol_id);
+        return;
+    }
+
+    SymbolTracker& s = state_[c.symbol_id];
+
+    // A fast rebuild is queued: this bar is in the window the refetch is
+    // about to replace.
+    if (s.FastRebuildPending()) {
+        return;
+    }
+
+    switch (s.ClassifyFast(c.open_time_ms)) {
+        case Arrival::kDuplicate:
+        case Arrival::kStale:
+            return;
+        case Arrival::kGap:
+            RequestFastRebuild(s);
+            return;
+        case Arrival::kFirst:
+        case Arrival::kNext:
+            break;
+    }
+
+    s.ApplyFast(c);
+    Evaluate(s);
+}
+
 void CoreManager::ApplyCandleComplete(SymbolTracker& s, TimeFrame frame) {
     // Per-timeframe notification hook. The state is already updated by the
     // time this runs; this is where anything that cares about "a bar on this
@@ -117,10 +165,14 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
     const SymbolTracker& s = state_[symbol_id];
     const CandleTracker& ltf = s.Ltf();
     const CandleTracker& htf = s.Htf();
+    const FastTurnoverTracker& fast = s.Fast();
 
     Conditions c;
 
-    const auto turnover = ltf.Turnover();
+    // Surge and liquidity read the FAST (5m) turnover window, not the LTF
+    // one - that window moved here entirely (DESIGN.md §16), so there is no
+    // 1h-granularity turnover left to fall back to.
+    const auto turnover = fast.Turnover();
 
     // Readiness is per indicator and ANDed here. A symbol missing history is
     // `not ready` and can never be ACTIVE - never "probably fine".
@@ -132,18 +184,20 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
     // recent / prev > surge_numerator_ / surge_denominator_, rearranged so
     // there is no division.
     //
-    // __int128 because the left side reaches ~2.4e16 (24 bars of BTC turnover
-    // at kVolumeScale) and the right side multiplies by up to ~130, giving
-    // ~3.1e18. That is inside int64's 9.2e18, but by only 3x - and the cost of
-    // being wrong is a silent sign flip on the comparison that decides the
-    // filter. One 128-bit multiply per closed bar is not a cost worth that
-    // risk.
+    // __int128 because the left side reaches ~2.4e16 (24h of BTC turnover at
+    // kVolumeScale, same magnitude whether summed over 24 1h bars or 288 5m
+    // bars) and the right side multiplies by up to ~130, giving ~3.1e18. That
+    // is inside int64's 9.2e18, but by only 3x - and the cost of being wrong
+    // is a silent sign flip on the comparison that decides the filter. One
+    // 128-bit multiply per closed bar is not a cost worth that risk.
     c.surge = static_cast<__int128>(turnover.recent) * surge_denominator_ >
               static_cast<__int128>(turnover.prev) * surge_numerator_;
 
-    // The one condition that spans both timeframes, and it spans as two
-    // scalar reads: the latest 1h close against the HTF EMA.
-    c.trend = ltf.LastClose() > htf.GetEma();
+    // The one condition that spans timeframes, and it spans as two scalar
+    // reads: the latest CLOSED bar's close - on whichever stream is freshest,
+    // which between two 1h closes is the 5m one - against the HTF EMA, which
+    // is still fed only by closed 4h bars.
+    c.trend = fast.LastClose() > htf.GetEma();
 
     c.volatility = ltf.GetNatrBp() > min_natr_bp_;
 
@@ -158,13 +212,13 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
 void CoreManager::Evaluate(SymbolTracker& s) {
     const Conditions c = EvaluateConditions(s.Id());
     if (c.All()) {
-        TryActivate(s, c);
+        TryActivate(s);
     } else {
         TryDeactivate(s, c);
     }
 }
 
-void CoreManager::TryActivate(SymbolTracker& s, const Conditions& c) {
+void CoreManager::TryActivate(SymbolTracker& s) {
     if (s.IsActive()) {
         return;  // edge-triggered: already active, nothing to announce
     }
@@ -172,8 +226,8 @@ void CoreManager::TryActivate(SymbolTracker& s, const Conditions& c) {
     active_instruments_.insert(s.Name());
     pending_transitions_.push_back({s.Id(), true});
     Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} natr={}bp turnover_recent={} prev={}", s.Name(),
-                s.Ltf().LastClose(), s.Htf().GetEma(), s.Ltf().GetNatrBp(), c.surge ? s.Ltf().Turnover().recent : 0,
-                c.surge ? s.Ltf().Turnover().prev : 0);
+                s.Fast().LastClose(), s.Htf().GetEma(), s.Ltf().GetNatrBp(), s.Fast().Turnover().recent,
+                s.Fast().Turnover().prev);
 }
 
 void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
@@ -212,9 +266,38 @@ void CoreManager::RequestRebuild(SymbolTracker& s) {
     Logger::Log(LogLevel::kWarning, "gap on {} after open_time={} - rebuild queued", s.Name(), s.LastLtfOpenTime());
 }
 
+void CoreManager::RequestFastRebuild(SymbolTracker& s) {
+    if (s.FastRebuildPending()) {
+        return;
+    }
+
+    s.SetFastRebuildPending(true);
+
+    // Fail closed immediately, same spirit as RequestRebuild - but lighter:
+    // ResetFast() only drops the turnover window's readiness, which flows
+    // into c.ready and therefore into Evaluate()/TryDeactivate() below
+    // through the NORMAL path. Unlike RequestRebuild, there is no separate
+    // forced-INACTIVE step here, because there is nothing to bypass: the
+    // 1h/4h trackers are untouched, so if the symbol was ACTIVE only because
+    // of them plus a now-invalid turnover window, the ordinary Evaluate()
+    // call correctly deactivates it and records the transition itself.
+    s.ResetFast();
+    pending_fast_rebuilds_.push_back(s.Id());
+    Evaluate(s);
+
+    Logger::Log(LogLevel::kWarning, "5m gap on {} after open_time={} - fast rebuild queued (1h/4h state untouched)",
+                s.Name(), s.LastFastOpenTime());
+}
+
 std::vector<uint32_t> CoreManager::TakePendingRebuilds() {
     std::vector<uint32_t> out;
     out.swap(pending_rebuilds_);
+    return out;
+}
+
+std::vector<uint32_t> CoreManager::TakePendingFastRebuilds() {
+    std::vector<uint32_t> out;
+    out.swap(pending_fast_rebuilds_);
     return out;
 }
 

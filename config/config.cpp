@@ -303,6 +303,10 @@ std::optional<ScreenerConfig> ScreenerConfig::FromArgs(int argc, char* argv[]) {
             if (!ParseUint(value, config.warmup_ltf_bars)) {
                 return std::nullopt;
             }
+        } else if (Match(arg, "--warmup-fast-bars=", value)) {
+            if (!ParseUint(value, config.warmup_fast_bars)) {
+                return std::nullopt;
+            }
         } else if (Match(arg, "--topics-per-sub=", value)) {
             if (!ParseUint(value, config.topics_per_subscribe)) {
                 return std::nullopt;
@@ -387,6 +391,15 @@ std::string ScreenerConfig::Validate() const {
     // than the EMA50 needs without anything saying so.
     if (warmup_ltf_bars > 1000) {
         return "warmup_ltf_bars must be <= 1000 (Bybit kline limit)";
+    }
+    // 576 = 2 * 288, the fast turnover window's size (md_core/fast_turnover_tracker.h's
+    // kFastSurgeWindowBars) - written as a literal, not an include, to avoid
+    // config/ taking a dependency on md_core/ for one bounds check.
+    if (warmup_fast_bars < 576) {
+        return "warmup_fast_bars must be at least 576 (two 24h windows of 5m bars)";
+    }
+    if (warmup_fast_bars > 1000) {
+        return "warmup_fast_bars must be <= 1000 (Bybit kline limit)";
     }
     if (topics_per_subscribe == 0) {
         return "topics_per_subscribe must be > 0";

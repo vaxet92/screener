@@ -35,17 +35,24 @@ inline constexpr int64_t kVolumeScale = 1'000'000;      // 1e6
 // carries a uint32_t id and dispatch is an array index.
 using Symbol = std::string;
 
-// Only the two timeframes this system has. Deliberately not M1..D1: an
-// enumerator nobody handles is a branch someone will assume is supported, and
-// it costs a -Wswitch warning the moment it is added.
+// Deliberately not M1..D1: an enumerator nobody handles is a branch someone
+// will assume is supported, and it costs a -Wswitch warning the moment it is
+// added.
+//
+// kM5 (DESIGN.md §16, not yet wired end to end) is a SECOND subscribed
+// stream, not an aggregate like kH4: the fast re-check reads a plain
+// turnover sum and a last close, neither of which is fed by anything else,
+// so there is nothing for it to aggregate FROM.
 enum class TimeFrame : uint8_t {
     kH1 = 0,  // LTF - what we subscribe to
     kH4 = 1,  // HTF - aggregated locally, never subscribed
+    kM5 = 2,  // fast re-check - also subscribed; never aggregated
 };
 
 inline constexpr int64_t kLtfMs = 3'600'000;   // 1h
 inline constexpr int64_t kHtfMs = 4 * kLtfMs;  // 4h
 inline constexpr int kLtfBarsPerHtf = 4;
+inline constexpr int64_t kFastMs = 300'000;    // 5m
 
 struct Candle {
     int64_t open_time_ms;          //  8  IDENTITY: dedup, gap detection, HTF alignment
@@ -53,7 +60,11 @@ struct Candle {
     Price open, high, low, close;  // 32  int64, x kPriceScale
     Volume turnover;               //  8  int64, x kVolumeScale
     uint32_t symbol_id;            //  4  index into CoreManager's state vector
-    uint32_t reserved_;            //  4  explicit, so the padding is a decision
+    TimeFrame timeframe;           //  1  which WS topic this bar closed on - plus 3 bytes
+                                    //     of ordinary compiler padding, no longer named
+                                    //     `reserved_`: it is read now, by the live-frame
+                                    //     dispatch that routes a Candle to ApplyCandle or
+                                    //     ApplyFastCandle (DESIGN.md §16).
 };
 
 // Trivially copyable is what lets this be memcpy'd into a ring buffer in

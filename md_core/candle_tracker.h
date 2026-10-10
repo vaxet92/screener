@@ -3,17 +3,21 @@
 // CandleTracker: the candle state and indicators for ONE timeframe.
 //
 // Why the decomposition is per timeframe and not per filter condition:
-// every indicator is driven by exactly one timeframe. The 24-bar turnover
-// windows and Wilder's ATR are fed by closed 1h bars; EMA50 is fed by
-// aggregated 4h bars. Nothing is fed by both. (DESIGN.md §6 records the
-// three-signal-manager alternative and why this replaced it: the trend
-// condition spans the two timeframes, so a TrendManager needed UpdateLtf()
-// AND UpdateHtf() - a class with two update paths keyed by timeframe is SSSSSSS
-// class fighting its own decomposition.)
+// every indicator is driven by exactly one timeframe. Wilder's ATR is fed by
+// closed 1h bars; EMA50 is fed by aggregated 4h bars. Nothing is fed by both.
+// (DESIGN.md §6 records the three-signal-manager alternative and why this
+// replaced it: the trend condition spans the two timeframes, so a
+// TrendManager needed UpdateLtf() AND UpdateHtf() - a class with two update
+// paths keyed by timeframe is a class fighting its own decomposition.)
 //
-// The three CONDITIONS are evaluated in CoreManager, which reads values from
-// both trackers. Trend is the only one that spans them, and it spans as two
-// scalar reads: the LTF's last close against the HTF's EMA.
+// The 24-bar turnover window that used to live on THIS tracker (surge and
+// liquidity) moved to FastTurnoverTracker, fed by a THIRD, independently
+// subscribed 5m stream (DESIGN.md §16) - it is not an aggregate of anything
+// this class owns, so it is not a third CandleTracker factory either.
+//
+// The CONDITIONS are evaluated in CoreManager, which reads values from all
+// three trackers. Trend is the one that spans timeframes, and it spans as
+// two scalar reads: the fast tracker's last close against the HTF's EMA.
 
 #include <cstdint>
 #include <deque>
@@ -21,7 +25,6 @@
 #include <optional>
 
 #include "md_core/indicators/ema.h"
-#include "md_core/indicators/turnover_window.h"
 #include "md_core/indicators/wilder_atr.h"
 #include "types/candle.h"
 
@@ -29,7 +32,6 @@ namespace screener {
 
 inline constexpr int kEmaPeriod = 50;
 inline constexpr int kAtrPeriod = 14;
-inline constexpr int kSurgeWindowBars = 24;
 
 // How many closed candles to keep per timeframe. Inspection and debugging
 // only - no condition reads them. Kept because a wrong ACTIVE verdict is
@@ -50,9 +52,10 @@ class CandleTracker {
     // outside the class and cannot reach a private constructor. These factories
     // are members, so they can. The raw `new` is handed to a unique_ptr on the
     // same line, so there is no window in which it could leak.
-    static CandleTrackerPtr MakeLtf() {  // H1: volatility + surge
-        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kTurnover | Use::kAtr, 0));
-    }
+    // H1: volatility only now. The turnover window that used to live here
+    // moved to FastTurnoverTracker, on the 5m stream (DESIGN.md §16) - surge
+    // and liquidity no longer read this tracker at all.
+    static CandleTrackerPtr MakeLtf() { return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kAtr, 0)); }
     // `ema_period` is runtime now (config.json), not the kEmaPeriod constant -
     // only meaningful here, since MakeLtf's timeframe never uses Ema.
     static CandleTrackerPtr MakeHtf(int ema_period) {  // H4: trend
@@ -82,9 +85,6 @@ class CandleTracker {
             recent_.pop_front();
         }
 
-        if (turnover_) {
-            turnover_->Update(c.turnover);
-        }
         if (atr_) {
             atr_->Update(c.high, c.low, c.close);
         }
@@ -97,9 +97,6 @@ class CandleTracker {
     // full reset plus a replay of REST history. Warm-up uses the same path:
     // Reset() then Apply() per bar, oldest first.
     void Reset() {
-        if (turnover_) {
-            turnover_->Reset();
-        }
         if (atr_) {
             atr_->Reset();
         }
@@ -138,29 +135,21 @@ class CandleTracker {
     bool AtrReady() const noexcept { return atr_ && atr_->Ready(); }
     int32_t GetNatrBp() const noexcept { return atr_->NatrBp(last_close_); }
 
-    bool HasTurnover() const noexcept { return turnover_.has_value(); }
-    TurnoverWindow<kSurgeWindowBars>::Value Turnover() const noexcept {
-        return turnover_ ? turnover_->Get() : TurnoverWindow<kSurgeWindowBars>::Value{false, 0, 0};
-    }
-
    private:
     enum Use : uint8_t {
         kEma = 1,
         kAtr = 2,
-        kTurnover = 4
     };
 
     // `ema_period` is unused unless `use & kEma` - MakeLtf passes 0 for it.
     explicit CandleTracker(TimeFrame frame, uint8_t use, int ema_period) : frame_(frame) {
         if (use & kEma) ema_.emplace(ema_period);
         if (use & kAtr) atr_.emplace();
-        if (use & kTurnover) turnover_.emplace();
     }
 
     TimeFrame frame_;
     std::optional<Ema> ema_;
     std::optional<WilderAtr<kAtrPeriod>> atr_;
-    std::optional<TurnoverWindow<kSurgeWindowBars>> turnover_;
 
     std::deque<Candle> recent_;
     Price last_close_ = 0;
