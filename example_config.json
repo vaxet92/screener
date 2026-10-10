@@ -1,0 +1,15 @@
+{
+  "// ema_period": "HTF (4h) EMA period the trend condition compares the latest 1h close against. Was a compile-time constant; warmup_ltf_bars is NOT auto-derived from this, so raising it without also raising warmup_ltf_bars in the main config leaves a symbol not-ready forever.",
+  "ema_period": 50,
+
+  "// surge_numerator": "Volume surge threshold, as recent*surge_denominator > prev*surge_numerator (no floating point). recent/prev are the sums of the last 24 and the 24 before that, closed 1h bars. 130/100 means recent must exceed prev by more than 30%.",
+  "surge_numerator": 130,
+  "// surge_denominator": "See surge_numerator.",
+  "surge_denominator": 100,
+
+  "// min_natr_bp": "Volatility floor, in basis points. NATR = Wilder ATR(14) / close, must exceed this. 100 = 1.00%.",
+  "min_natr_bp": 100,
+
+  "// min_turnover_usdt": "Liquidity floor: the same 24-bar recent-turnover sum the surge condition reads must be at least this many USDT. MUST be a decimal STRING, not a JSON number - parsed straight to a scaled integer, never via a double. \"0.00\" (the default) means off: any positive turnover satisfies it.",
+  "min_turnover_usdt": "0.00"
+}

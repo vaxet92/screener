@@ -2,15 +2,18 @@
 
 // ScreenerConfig: every tunable in one place, with defaults that work.
 //
-// No config FILE. One venue, one market, one timeframe pair - there is
-// nothing an operator must choose before the first run, so a file would only
-// be a second place for the truth to live and disagree with this one. The few
-// values worth changing are command-line flags.
+// An optional config FILE (config.json) now exists for the filter
+// thresholds: ema_period, the surge ratio and the NATR/turnover floors are
+// no longer compile-time constants, so there is something an operator can
+// legitimately choose before a run. Everything else stays a flag - see
+// DESIGN.md for why only the threshold group moved.
 
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+
+#include "types/candle.h"
 
 namespace screener {
 
@@ -151,9 +154,43 @@ struct ScreenerConfig {
 
     bool verbose = false;
 
+    // ---- Filter thresholds (optional config.json) --------------------------
+    //
+    // Defaults match the values CoreManager/Ema used as compile-time
+    // constants before this file existed. Overridable via config.json only -
+    // there is no flag for these, because a threshold typed on a command
+    // line is exactly the kind of value that gets forgotten between runs.
+
+    // EMA period on the HTF (4h) close. Was a template parameter
+    // (Ema<kEmaPeriod>); now a runtime field the indicator is constructed
+    // with. warmup_ltf_bars is NOT auto-derived from this in the file reader
+    // - see Validate() for why that would be the wrong place to do it.
+    uint32_t ema_period = 50;
+
+    // Volume surge: recent_turnover * surge_denominator > prev_turnover *
+    // surge_numerator. Same integer cross-multiplication CoreManager always
+    // used; these are now the operands instead of file-scope constants.
+    int64_t surge_numerator = 130;
+    int64_t surge_denominator = 100;
+
+    // NATR floor, in basis points.
+    int32_t min_natr_bp = 100;
+
+    // Liquidity floor: the recent-window turnover sum (same window the surge
+    // condition reads) must exceed this, scaled by kVolumeScale. Parsed from
+    // a decimal USDT string in config.json straight to a scaled integer -
+    // never via a double, same rule as every other price/volume value in
+    // this system.
+    Volume min_turnover = 0;
+
+    // Where the threshold group above is read from. A missing default file
+    // means "use the compiled defaults"; a missing file named explicitly
+    // with --config= is an error, same policy as --env-file=.
+    std::string config_file = "config.json";
+
     // Reads --max-symbols=N, --warmup-bars=N, --topics-per-sub=N,
-    // --telegram, --env-file=PATH, --verbose, plus TELEGRAM_BOT_TOKEN /
-    // TELEGRAM_CHAT_ID from `.env` and the environment.
+    // --telegram, --env-file=PATH, --config=PATH, --verbose, plus
+    // TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID from `.env` and the environment.
     // nullopt on an unrecognised or malformed flag: the caller refuses to
     // start rather than run with a value the operator did not mean.
     static std::optional<ScreenerConfig> FromArgs(int argc, char* argv[]);
@@ -179,5 +216,22 @@ struct ScreenerConfig {
 // Separate from the file reading so the parsing is testable without a
 // filesystem.
 std::string ApplyDotEnv(std::string_view content, ScreenerConfig& config);
+
+// Applies config.json CONTENT (not a path) to `config`. Empty return on
+// success, otherwise the reason. Only the five threshold fields above are
+// recognised; any other key is an error, unlike .env - this file has no
+// other tool sharing it, so an unrecognised key is a typo the operator
+// should hear about, not a quietly ignored line.
+//
+// EXCEPT a "//"-prefixed key, which is a COMMENT and is ignored. Plain JSON
+// has no comment syntax, so this is the one escape from "unrecognised key is
+// fatal" - see example_config.json, which uses it to document every field
+// without becoming unusable as a direct copy to config.json.
+//
+// Values are read straight to the field's integer type via simdjson; a
+// turnover floor given as a JSON number with a fractional part (e.g.
+// 1000000.50) is rejected - see the .cpp for why a string is required for
+// that one field instead.
+std::string ApplyConfigJson(std::string_view content, ScreenerConfig& config);
 
 }  // namespace screener

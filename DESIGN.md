@@ -18,13 +18,14 @@ Watches 500–1000 **Bybit USDT perpetual futures** (`category=linear`,
 `contractType=LinearPerpetual`) and marks each symbol `ACTIVE` or `INACTIVE` on every
 closed 1-hour candle. It also ranks the ACTIVE set by NATR.
 
-Three conditions, all of which must hold for ACTIVE (thresholds in `config.json`):
+Four conditions, all of which must hold for ACTIVE (thresholds in `config.json`, §15):
 
 | Condition | Definition | Default |
 |---|---|---|
 | Volume surge | (Σ turnover of last 24 closed LTF bars) / (Σ of the 24 before) − 1 | > 30 % |
 | Trend | last LTF close > EMA50 on HTF bars | true |
 | Volatility | NATR = ATR(14, Wilder, LTF) / close × 100 | ≥ 1.0 % |
+| Liquidity | Σ turnover of last 24 closed LTF bars (the surge condition's own "recent" window) | ≥ `min_turnover` (0 by default — off until configured) |
 
 **LTF = 1h** (subscribed) and **HTF = 4h** (aggregated locally, §5).
 
@@ -1366,3 +1367,82 @@ It reads the real `.env` (via `SCREENER_SOURCE_DIR`, so it works from the build 
 sends a realistic startup message through the real transport, and prints what came back. It asserts nothing about the send: the outcome depends on a bot and a `chat_id` this
 process cannot verify, so what it gives you is Telegram's own response body. `GTEST_SKIP`
 when there is no usable `.env`, and `DISABLED_` so a normal run never touches the network.
+
+---
+
+## 15. Filter thresholds — `config.json` — **[partial]**
+
+§1 always documented the three filter thresholds as living "in `config.json`"; until this
+section, `config.h` itself said the opposite — "No config FILE... a file would only be a
+second place for the truth to live and disagree with this one." That was a real
+doc/code disagreement, not a stale reference: §1 described an intended design the code had
+not yet built. It is resolved by actually building the file, not by editing §1 to match the
+code, because the reasoning in §1 (an operator has something to choose before the first
+run) is sound once `ema_period` stops being a compile-time constant.
+
+**What moved out of compile-time constants, and why only these:**
+
+- `ema_period` — was `Ema<kEmaPeriod>`, a template parameter (`md_core/indicators/ema.h`).
+- the volume-surge ratio — was `kSurgeNumerator`/`kSurgeDenominator` (`md_core/core.h`).
+- the NATR floor, in basis points — was `kMinNatrBp` (`md_core/core.h`).
+- a new fourth condition, **liquidity**: `ltf.Turnover().recent` (the same window the surge
+  condition already sums) must exceed `min_turnover`. Added because the surge condition
+  alone lets a symbol pass on a 30% move over a near-zero base (e.g. $500 → $700), which is
+  a ratio fact, not a liquidity fact — a screener meant to surface tradeable moves should not
+  ACTIVATE something with no real volume behind it. This makes `Conditions` a 4-field AND:
+  `ready && surge && trend && volatility && liquidity`. `screener_prompt.md`'s three-condition
+  filter description predates this and should be read as historical for the liquidity field,
+  same status as every other place this file says its API facts are stale.
+
+**What stayed a flag, and why those five and no more:** everything else in `ScreenerConfig`
+(venue hosts, `warmup_ltf_bars`, ping/reconnect timing, REST pacing, Telegram knobs) is
+either a Bybit protocol fact with one correct value, or genuinely a per-run choice an
+operator types once (`--max-symbols=20` for a fast dev run). The threshold group is
+different: it is a *filter definition*, tuned by feel, iterated on without a recompile, and
+risky to type correctly on a command line — the surge ratio and the NATR floor are exactly
+the two numbers from §1's table, and a `--surge-numerator=130` flag split across two
+dashes-and-equals flags is a worse interface than one file holding the filter's definition
+in one place.
+
+**Format and parser:** JSON over TOML, read with `simdjson`'s `ondemand` DOM API — already
+a project dependency for the WS/REST wire format (`md_provider/bybit_parser.cpp`), so this
+adds no new dependency for five scalar fields. `config/config.cpp`'s `ApplyConfigJson`
+mirrors `ApplyDotEnv`'s policy: a missing *default* `config.json` means "use the compiled
+defaults" (same as a missing default `.env` meaning "use the environment"); a path named
+with `--config=` must exist; any key `ApplyConfigJson` does not recognise is **fatal**,
+unlike `.env`'s "ignore keys we don't own" — nothing else shares this file, so a typo in it
+should be heard, not silently kept at its default.
+
+**Why `min_turnover` is read as a decimal STRING, not a JSON number:** every other
+price/turnover value in this system is parsed straight from a decimal string to a scaled
+integer (`ParseScaledDecimal`, §3) specifically to avoid a floating-point intermediate.
+simdjson's `get_double()` would reintroduce exactly that rounding step for one field only,
+which is a worse inconsistency than requiring the operator write `"250000.00"` instead of
+`250000.00`.
+
+**`warmup_ltf_bars` is NOT auto-derived from `ema_period`.** It stays an independent,
+separately-validated field. If `ema_period` becomes operator-tunable and `warmup_ltf_bars`
+does not track it, raising the period without also raising warm-up bars leaves a symbol
+`not ready` forever — silently, since "not ready" is indistinguishable from "briefly still
+warming up" from the log alone. Flagging this as an **open question** (§12) rather than
+deriving it automatically: a derived value (e.g. `ema_period * 4 * 3 + 3`, matching the
+existing comment's "4h EMA needs `period` HTF bars, aim for ~3×") removes the operator
+error but also removes their ability to warm up faster for a dev run at a given period —
+worth deciding once, not guessing now.
+
+**`[DRILL]` work still open**, per `screener_prompt.md` §4 (Phase 0: `CoreManager` loop +
+filter + transitions; the integer indicators): `Ema<Period>` de-templating to a runtime
+`period_` field, `CoreManager`'s `Conditions` struct gaining `bool liquidity`, and
+`CoreManager`'s threshold values moving from file-scope `constexpr` to constructor-supplied
+fields. Claude wrote the `config.json` plumbing (`[SCAFFOLD]`); these three touch `[DRILL]`
+components and are Anton's to write cold, per the interface Claude hands over separately.
+
+**Tests:** `tests/unit_tests/src/test_config.cpp` gained a `ConfigJson` suite (parses each
+field, leaves unmentioned fields at their compiled default, rejects an unrecognised key,
+malformed JSON, a top-level non-object, `ema_period <= 1`, and a turnover floor given as a
+JSON number instead of a string) and a `ConfigJsonFile` suite through `FromArgs` (missing
+default is fine, an explicit missing path is fatal, a valid explicit file is applied, a
+malformed explicit file is fatal) — same split as the `.env` tests, for the same reason:
+the parser's failure modes are tested on content, and the file-reading policy needs a real
+temporary file to observe. `Conditions.liquidity` and the de-templated `Ema` are untested
+until the `[DRILL]` pieces above land.

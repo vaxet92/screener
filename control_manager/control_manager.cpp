@@ -47,7 +47,9 @@ ControlManager::ControlManager(const ScreenerConfig& config)
       status_timer_(ioc_),
       signals_(ioc_, SIGINT, SIGTERM),
       limiter_(ioc_, config.rest_max_requests_per_window, std::chrono::milliseconds(config.rest_window_ms)),
-      notifier_(ioc_, ssl_ctx_, config) {
+      notifier_(ioc_, ssl_ctx_, config),
+      core_(config.ema_period, config.surge_numerator, config.surge_denominator, config.min_natr_bp,
+            config.min_turnover) {
     load_root_certificates(ssl_ctx_);
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 }
@@ -187,6 +189,14 @@ void ControlManager::FinishWarmup() {
         return;
     }
 
+    // Discard: CoreManager::Warmup's internal Evaluate() call pushed a
+    // Transition for every symbol that came out of REST warm-up already
+    // ACTIVE. NotifyStarted (below) reports that starting set directly from
+    // ActiveInstruments() - these queued entries would otherwise duplicate
+    // it as one individual "ACTIVE SYMBOL" message per symbol right after
+    // startup.
+    (void)core_.TakeTransitions();
+
     // Order matters: flip the flag BEFORE the replay. OnCandle consults it,
     // and a frame delivered between the first replayed bar and the last must
     // go straight to ApplyCandle, not back onto a buffer nobody will drain
@@ -275,16 +285,16 @@ TelegramNotifier::StartupReport ControlManager::LogWarmupReadiness() const {
         // a brand-new listing genuinely has no history, while ltf=0 means its
         // warm-up REQUEST failed and the symbol is missing for a reason we
         // could fix.
-        report.not_ready.push_back(ltf_bars == 0
-                                       ? fmt::format("{} - no history (warm-up request failed)", core_.NameOf(id))
-                                       : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h)", core_.NameOf(id),
-                                                     ltf_bars, htf_bars, kEmaPeriod, kEmaPeriod));
+        report.not_ready.push_back(
+            ltf_bars == 0 ? fmt::format("{} - no history (warm-up request failed)", core_.NameOf(id))
+                          : fmt::format("{} - {} x 1h, {} x 4h (EMA{} needs {} x 4h)", core_.NameOf(id), ltf_bars,
+                                        htf_bars, core_.EmaPeriod(), core_.EmaPeriod()));
         // kWarning rather than kDebug, because this is the quiet failure mode
         // of the whole system: a not-ready symbol can never go ACTIVE, so it
         // vanishes from the output with no error anywhere. At ~800 symbols the
         // READY lines would bury it, which is why only this branch is loud.
         Logger::Log(LogLevel::kWarning, "{}: warm-up complete, NOT READY (ltf={} bars, htf={} bars; EMA{} needs {})",
-                    core_.NameOf(id), ltf_bars, htf_bars, kEmaPeriod, kEmaPeriod);
+                    core_.NameOf(id), ltf_bars, htf_bars, core_.EmaPeriod(), core_.EmaPeriod());
     }
 
     // One line that answers "why is nothing ACTIVE". The three conditions are

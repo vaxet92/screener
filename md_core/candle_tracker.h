@@ -51,10 +51,12 @@ class CandleTracker {
     // are members, so they can. The raw `new` is handed to a unique_ptr on the
     // same line, so there is no window in which it could leak.
     static CandleTrackerPtr MakeLtf() {  // H1: volatility + surge
-        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kTurnover | Use::kAtr));
+        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kTurnover | Use::kAtr, 0));
     }
-    static CandleTrackerPtr MakeHtf() {  // H4: trend
-        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH4, Use::kEma));
+    // `ema_period` is runtime now (config.json), not the kEmaPeriod constant -
+    // only meaningful here, since MakeLtf's timeframe never uses Ema.
+    static CandleTrackerPtr MakeHtf(int ema_period) {  // H4: trend
+        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH4, Use::kEma, ema_period));
     }
 
     // Copy deleted, move defaulted.
@@ -148,14 +150,15 @@ class CandleTracker {
         kTurnover = 4
     };
 
-    explicit CandleTracker(TimeFrame frame, uint8_t use) : frame_(frame) {
-        if (use & kEma) ema_.emplace();
+    // `ema_period` is unused unless `use & kEma` - MakeLtf passes 0 for it.
+    explicit CandleTracker(TimeFrame frame, uint8_t use, int ema_period) : frame_(frame) {
+        if (use & kEma) ema_.emplace(ema_period);
         if (use & kAtr) atr_.emplace();
         if (use & kTurnover) turnover_.emplace();
     }
 
     TimeFrame frame_;
-    std::optional<Ema<kEmaPeriod>> ema_;
+    std::optional<Ema> ema_;
     std::optional<WilderAtr<kAtrPeriod>> atr_;
     std::optional<TurnoverWindow<kSurgeWindowBars>> turnover_;
 

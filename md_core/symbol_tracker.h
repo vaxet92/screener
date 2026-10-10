@@ -38,8 +38,11 @@ enum class Arrival {
 
 class SymbolTracker {
    public:
-    SymbolTracker(uint32_t id, Symbol symbol)
-        : id_(id), symbol_(std::move(symbol)), ltf_(CandleTracker::MakeLtf()), htf_(CandleTracker::MakeHtf()) {}
+    SymbolTracker(uint32_t id, Symbol symbol, int ema_period)
+        : id_(id),
+          symbol_(std::move(symbol)),
+          ltf_(CandleTracker::MakeLtf()),
+          htf_(CandleTracker::MakeHtf(ema_period)) {}
 
     uint32_t Id() const noexcept { return id_; }
     const Symbol& Name() const noexcept { return symbol_; }

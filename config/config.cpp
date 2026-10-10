@@ -6,12 +6,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <simdjson.h>
 #include <sstream>
 #include <string>
 #include <string_view>
 
+#include "md_provider/decimal.h"
+
 namespace screener {
 namespace {
+
+namespace ondemand = simdjson::ondemand;
 
 // Returns false on a malformed number rather than clamping or defaulting.
 // A typo in --warmup-bars should stop the run, not quietly change the
@@ -178,12 +183,89 @@ std::string ApplyDotEnv(std::string_view content, ScreenerConfig& config) {
     return {};
 }
 
+std::string ApplyConfigJson(std::string_view content, ScreenerConfig& config) {
+    ondemand::parser parser;
+    simdjson::padded_string padded(content);  // startup-only: not the message path
+
+    ondemand::document doc;
+    if (parser.iterate(padded).get(doc)) {
+        return config.config_file + ": not valid JSON";
+    }
+
+    ondemand::object obj;
+    if (doc.get_object().get(obj)) {
+        return config.config_file + ": expected a JSON object";
+    }
+
+    for (auto field : obj) {
+        std::string_view key;
+        if (field.unescaped_key().get(key)) {
+            return config.config_file + ": malformed key";
+        }
+        // A "//"-prefixed key is a COMMENT, not a typo. Plain JSON has no
+        // comment syntax, and every other key is fatal if unrecognised - so
+        // without an escape, example_config.json could not annotate a field
+        // without becoming unusable as a direct copy to config.json.
+        if (key.size() >= 2 && key.substr(0, 2) == "//") {
+            continue;
+        }
+
+        const std::string where = config.config_file + ": \"" + std::string(key) + "\": ";
+
+        if (key == "ema_period") {
+            uint64_t v = 0;
+            if (field.value().get_uint64().get(v) || v <= 1 || v > 1'000'000) {
+                return where + "expected an integer > 1";
+            }
+            config.ema_period = static_cast<uint32_t>(v);
+        } else if (key == "surge_numerator") {
+            int64_t v = 0;
+            if (field.value().get_int64().get(v) || v <= 0) {
+                return where + "expected an integer > 0";
+            }
+            config.surge_numerator = v;
+        } else if (key == "surge_denominator") {
+            int64_t v = 0;
+            if (field.value().get_int64().get(v) || v <= 0) {
+                return where + "expected an integer > 0";
+            }
+            config.surge_denominator = v;
+        } else if (key == "min_natr_bp") {
+            int64_t v = 0;
+            if (field.value().get_int64().get(v) || v < 0 || v > 1'000'000) {
+                return where + "expected an integer >= 0";
+            }
+            config.min_natr_bp = static_cast<int32_t>(v);
+        } else if (key == "min_turnover_usdt") {
+            // A STRING, not a JSON number - a fractional USDT amount parsed
+            // through a double intermediate would reintroduce exactly the
+            // rounding error the scaled-integer representation exists to
+            // avoid. Same rule as every venue-reported price/volume.
+            std::string_view v;
+            if (field.value().get_string().get(v) || v.empty()) {
+                return where + "expected a decimal string, e.g. \"1000000.00\"";
+            }
+            config.min_turnover = static_cast<Volume>(ParseScaledDecimal<6>(v));
+        } else {
+            // Unlike .env, nothing else shares this file - an unrecognised
+            // key is a typo the operator should hear about, not a silently
+            // ignored line.
+            return where + "unrecognised key";
+        }
+    }
+
+    return {};
+}
+
 std::optional<ScreenerConfig> ScreenerConfig::FromArgs(int argc, char* argv[]) {
     ScreenerConfig config;
 
     // Set by --env-file=. It decides whether a missing file is an error: the
     // default .env is optional, a path the operator typed is not.
     bool env_file_explicit = false;
+
+    // Same policy, for --config= / config.json.
+    bool config_file_explicit = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -196,6 +278,9 @@ std::optional<ScreenerConfig> ScreenerConfig::FromArgs(int argc, char* argv[]) {
         } else if (Match(arg, "--env-file=", value)) {
             config.env_file = std::string(value);
             env_file_explicit = true;
+        } else if (Match(arg, "--config=", value)) {
+            config.config_file = std::string(value);
+            config_file_explicit = true;
         } else if (Match(arg, "--max-symbols=", value)) {
             if (!ParseUint(value, config.max_symbols)) {
                 return std::nullopt;
@@ -238,6 +323,19 @@ std::optional<ScreenerConfig> ScreenerConfig::FromArgs(int argc, char* argv[]) {
         return std::nullopt;
     }
 
+    // config.json: optional, same missing-vs-explicit policy as .env. Loaded
+    // after flags (so --config= decides the path) and before Validate() (so
+    // a bad threshold is caught there, in one place, rather than twice).
+    if (const std::optional<std::string> content = ReadFile(config.config_file)) {
+        if (const std::string error = ApplyConfigJson(*content, config); !error.empty()) {
+            std::fprintf(stderr, "screener: %s\n", error.c_str());
+            return std::nullopt;
+        }
+    } else if (config_file_explicit) {
+        std::fprintf(stderr, "screener: --config=%s cannot be read\n", config.config_file.c_str());
+        return std::nullopt;
+    }
+
     if (const char* token = std::getenv("TELEGRAM_BOT_TOKEN")) {
         config.telegram_token = token;
     }
@@ -274,6 +372,12 @@ std::string ScreenerConfig::Validate() const {
     }
     if (max_missed_pongs == 0) {
         return "max_missed_pongs must be > 0";
+    }
+    if (surge_numerator <= surge_denominator) {
+        return "surge_numerator must be > surge_denominator (a surge ratio <= 1 would always pass)";
+    }
+    if (min_turnover < 0) {
+        return "min_turnover_usdt must be >= 0";
     }
     if (telegram_enabled) {
         // Refuse to start rather than run with notifications silently off.

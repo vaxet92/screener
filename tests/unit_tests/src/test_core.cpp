@@ -39,10 +39,17 @@ std::vector<Candle> History(uint32_t symbol_id, int count, double close, double 
     return out;
 }
 
+// Thresholds matching what used to be compile-time constants, now that they
+// are config.json fields (DESIGN.md §15) - keeps every existing test's
+// fixtures and expectations unchanged except where a test explicitly varies
+// a threshold.
+CoreManager MakeCore() { return CoreManager(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
+                                             /*min_natr_bp=*/100, /*min_turnover=*/0); }
+
 }  // namespace
 
 TEST(CoreManager, UniverseAssignsIdsAsIndices) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT", "ETHUSDT", "SOLUSDT"});
 
     ASSERT_EQ(core.SymbolCount(), 3u);
@@ -61,7 +68,7 @@ TEST(CoreManager, UniverseAssignsIdsAsIndices) {
 // A symbol without enough history is `not ready` and can never be ACTIVE -
 // never "probably fine".
 TEST(CoreManager, NotReadyCanNeverBeActive) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     // 40 bars: not enough for the 48-bar turnover window or the 50-bar EMA on
@@ -76,7 +83,7 @@ TEST(CoreManager, NotReadyCanNeverBeActive) {
 }
 
 TEST(CoreManager, BecomesReadyOnceEveryIndicatorHasHistory) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     // EMA50 on 4h needs 50 HTF bars = 200 LTF bars.
@@ -91,7 +98,7 @@ TEST(CoreManager, BecomesReadyOnceEveryIndicatorHasHistory) {
 // ---------------------------------------------------------------------------
 
 TEST(CoreManager, DuplicateOpenTimeIsDropped) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -108,7 +115,7 @@ TEST(CoreManager, DuplicateOpenTimeIsDropped) {
 }
 
 TEST(CoreManager, OlderBarIsDropped) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -122,7 +129,7 @@ TEST(CoreManager, OlderBarIsDropped) {
 }
 
 TEST(CoreManager, ExactNextBarIsApplied) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -138,7 +145,7 @@ TEST(CoreManager, ExactNextBarIsApplied) {
 // ---------------------------------------------------------------------------
 
 TEST(CoreManager, GapQueuesARebuildAndDoesNotApplyTheBar) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -156,7 +163,7 @@ TEST(CoreManager, GapQueuesARebuildAndDoesNotApplyTheBar) {
 }
 
 TEST(CoreManager, GapForcesTheSymbolInactiveImmediately) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     // Build a state that passes all three conditions, then confirm it is
@@ -185,7 +192,7 @@ TEST(CoreManager, GapForcesTheSymbolInactiveImmediately) {
 // main loop drains it. Servicing it inline would re-enter ApplyCandle once
 // per history bar while the outer call is still on the stack.
 TEST(CoreManager, PendingRebuildsAreDrainedNotServicedInline) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT", "ETHUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
     core.Warmup(1, History(1, 300, 100.0, 1.0));
@@ -200,7 +207,7 @@ TEST(CoreManager, PendingRebuildsAreDrainedNotServicedInline) {
 }
 
 TEST(CoreManager, ASecondGapDoesNotQueueTheSameSymbolTwice) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -214,7 +221,7 @@ TEST(CoreManager, ASecondGapDoesNotQueueTheSameSymbolTwice) {
 // by the refetch itself - dedup drops it. This is what removed the need for a
 // warm-up buffer entirely.
 TEST(CoreManager, BarsArrivingBeforeTheRebuildAreDroppedAndRecoveredByIt) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -240,7 +247,7 @@ TEST(CoreManager, BarsArrivingBeforeTheRebuildAreDroppedAndRecoveredByIt) {
 // close against a one-period-stale EMA50 - wrong once every four hours, which
 // is rare enough to survive casual testing and frequent enough to matter.
 TEST(CoreManager, HtfIsUpdatedBeforeTheFilterRunsOnABoundaryBar) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
 
@@ -264,7 +271,7 @@ TEST(CoreManager, HtfIsUpdatedBeforeTheFilterRunsOnABoundaryBar) {
 // ---------------------------------------------------------------------------
 
 TEST(CoreManager, ActivatesWhenAllThreeConditionsHold) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -285,7 +292,7 @@ TEST(CoreManager, ActivatesWhenAllThreeConditionsHold) {
 }
 
 TEST(CoreManager, FlatTurnoverFailsTheSurgeCondition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -303,7 +310,7 @@ TEST(CoreManager, FlatTurnoverFailsTheSurgeCondition) {
 // Exactly +30% must NOT pass: the test is a strict inequality, so this pins
 // the boundary rather than leaving it to a later refactor to guess.
 TEST(CoreManager, SurgeBoundaryIsExclusive) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -317,7 +324,7 @@ TEST(CoreManager, SurgeBoundaryIsExclusive) {
 }
 
 TEST(CoreManager, LowVolatilityFailsTheNatrCondition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -334,8 +341,76 @@ TEST(CoreManager, LowVolatilityFailsTheNatrCondition) {
     EXPECT_FALSE(core.TrackerAt(0).IsActive());
 }
 
+// min_turnover = 0 (MakeCore's default) must behave exactly like the
+// pre-config.json compile-time constants - this is the regression guard for
+// the new liquidity condition.
+TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+
+    EXPECT_TRUE(core.EvaluateConditions(0).liquidity);
+}
+
+// A min_turnover above the fixture's recent-window sum must fail the
+// liquidity condition and keep the symbol out of ACTIVE even though
+// surge/trend/volatility all hold - same fixture as
+// ActivatesWhenAllThreeConditionsHold, only the threshold differs.
+TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
+    CoreManager core(/*ema_period=*/50, /*surge_numerator=*/130, /*surge_denominator=*/100,
+                      /*min_natr_bp=*/100, /*min_turnover=*/V(100.0) * 24 + 1);
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 276 ? 100.0 : 1.0;  // recent-window sum = 24 * 100.0
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+
+    const auto c = core.EvaluateConditions(0);
+    EXPECT_TRUE(c.surge);
+    EXPECT_TRUE(c.trend);
+    EXPECT_TRUE(c.volatility);
+    EXPECT_FALSE(c.liquidity);
+    EXPECT_FALSE(core.TrackerAt(0).IsActive());
+}
+
+// ema_period is a config.json field now (DESIGN.md §15), not the compiled
+// constant 50 - this proves warm-up and the trend condition both honour a
+// different period, not a hardcoded one.
+TEST(CoreManager, HonoursARuntimeEmaPeriodOtherThanFifty) {
+    CoreManager core(/*ema_period=*/10, /*surge_numerator=*/130, /*surge_denominator=*/100,
+                      /*min_natr_bp=*/100, /*min_turnover=*/0);
+    core.SetUniverse({"BTCUSDT"});
+
+    // Period 10 on the HTF (4h) needs 10 * 4 = 40 LTF bars to produce a first
+    // EMA value - far fewer than period 50's 200, so a short history that
+    // would leave the default-period fixture `not ready` is enough here.
+    std::vector<Candle> history;
+    for (int i = 0; i < 80; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 56 ? 100.0 : 1.0;  // last 24 bars surge
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+
+    const auto c = core.EvaluateConditions(0);
+    EXPECT_TRUE(c.ready);
+    EXPECT_TRUE(c.trend);
+    EXPECT_TRUE(core.TrackerAt(0).IsActive());
+}
+
 TEST(CoreManager, DeactivatesWhenAConditionStopsHolding) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -362,7 +437,7 @@ TEST(CoreManager, DeactivatesWhenAConditionStopsHolding) {
 // transition is already pending the moment Warmup returns - no ApplyCandle
 // needed to observe it.
 TEST(CoreManager, ActivatingPushesATransition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -381,7 +456,7 @@ TEST(CoreManager, ActivatingPushesATransition) {
 }
 
 TEST(CoreManager, DeactivatingPushesATransition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -405,7 +480,7 @@ TEST(CoreManager, DeactivatingPushesATransition) {
 }
 
 TEST(CoreManager, TakeTransitionsDrainsNotServicedInline) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -423,7 +498,7 @@ TEST(CoreManager, TakeTransitionsDrainsNotServicedInline) {
 // Edge-triggered: a bar that keeps the symbol ACTIVE must not add a second
 // transition on top of the one Warmup already recorded.
 TEST(CoreManager, StayingActiveDoesNotPushATransition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -447,7 +522,7 @@ TEST(CoreManager, StayingActiveDoesNotPushATransition) {
 // must record the edge itself - miss it and chat keeps showing a symbol
 // ACTIVE after a gap has already invalidated it.
 TEST(CoreManager, GapForcesInactiveAndPushesATransition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -471,7 +546,7 @@ TEST(CoreManager, GapForcesInactiveAndPushesATransition) {
 
 // A gap on a symbol that was never ACTIVE has nothing to announce.
 TEST(CoreManager, GapOnAnAlreadyInactiveSymbolPushesNoTransition) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     core.Warmup(0, History(0, 300, 100.0, 1.0));
     core.TakeTransitions();  // drain anything Warmup might have recorded
@@ -483,7 +558,7 @@ TEST(CoreManager, GapOnAnAlreadyInactiveSymbolPushesNoTransition) {
 }
 
 TEST(CoreManager, SetUniverseClearsPendingTransitions) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
     std::vector<Candle> history;
@@ -506,8 +581,8 @@ TEST(CoreManager, SetUniverseClearsPendingTransitions) {
 TEST(CoreManager, ReplayIsDeterministic) {
     const auto history = History(0, 300, 100.0, 1.0);
 
-    CoreManager a;
-    CoreManager b;
+    CoreManager a = MakeCore();
+    CoreManager b = MakeCore();
     a.SetUniverse({"BTCUSDT"});
     b.SetUniverse({"BTCUSDT"});
     a.Warmup(0, history);
@@ -519,7 +594,7 @@ TEST(CoreManager, ReplayIsDeterministic) {
 }
 
 TEST(CoreManager, UnknownSymbolIdIsIgnored) {
-    CoreManager core;
+    CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
     // Must not crash or write out of bounds.
     core.ApplyCandle(Bar(99, kLtfMs, 100.0, 1.0));

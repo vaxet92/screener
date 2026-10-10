@@ -42,6 +42,19 @@ std::string WriteTempEnv(const std::string& content) {
     return path;
 }
 
+ScreenerConfig ParseJson(const std::string& content, std::string& error) {
+    ScreenerConfig config;
+    error = ApplyConfigJson(content, config);
+    return config;
+}
+
+std::string WriteTempConfigJson(const std::string& content) {
+    const std::string path = std::string(testing::TempDir()) + "screener_test_config.json";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << content;
+    return path;
+}
+
 }  // namespace
 
 TEST(DotEnv, ReadsBothSecrets) {
@@ -229,6 +242,119 @@ TEST(DotEnvFile, SecretsWithoutTheFlagLeaveNotificationsOff) {
 
     ASSERT_TRUE(c.has_value());
     EXPECT_FALSE(c->telegram_enabled);
+}
+
+TEST(ConfigJson, ReadsAllFiveThresholdFields) {
+    std::string error;
+    const ScreenerConfig c = ParseJson(
+        R"({"ema_period": 20, "surge_numerator": 150, "surge_denominator": 100,
+            "min_natr_bp": 80, "min_turnover_usdt": "250000.50"})",
+        error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.ema_period, 20u);
+    EXPECT_EQ(c.surge_numerator, 150);
+    EXPECT_EQ(c.surge_denominator, 100);
+    EXPECT_EQ(c.min_natr_bp, 80);
+    EXPECT_EQ(c.min_turnover, 250000500000);  // 250000.50 * kVolumeScale (1e6)
+}
+
+TEST(ConfigJson, LeavesUnmentionedFieldsAtTheCompiledDefault) {
+    std::string error;
+    const ScreenerConfig c = ParseJson(R"({"ema_period": 20})", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.ema_period, 20u);
+    EXPECT_EQ(c.surge_numerator, 130);   // unmentioned: compiled default
+    EXPECT_EQ(c.surge_denominator, 100);  // unmentioned: compiled default
+}
+
+TEST(ConfigJson, IgnoresASlashSlashPrefixedCommentKey) {
+    // Plain JSON has no comment syntax; "//"-prefixed keys are the one
+    // escape from "unrecognised key is fatal", so example_config.json can
+    // document a field without becoming unusable as a direct copy to
+    // config.json.
+    std::string error;
+    const ScreenerConfig c = ParseJson(R"({"// ema_period": "HTF EMA period", "ema_period": 20})", error);
+
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_EQ(c.ema_period, 20u);
+}
+
+TEST(ConfigJson, RejectsAnUnrecognisedKey) {
+    std::string error;
+    // Unlike .env, nothing else shares this file - a typo should be heard.
+    ParseJson(R"({"ema_perido": 20})", error);
+
+    ASSERT_FALSE(error.empty());
+    EXPECT_NE(error.find("ema_perido"), std::string::npos) << error;
+}
+
+TEST(ConfigJson, RejectsMalformedJson) {
+    std::string error;
+    ParseJson("{not json", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(ConfigJson, RejectsATopLevelArray) {
+    std::string error;
+    ParseJson("[1, 2, 3]", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(ConfigJson, RejectsEmaPeriodOfOneOrLess) {
+    std::string error;
+    ParseJson(R"({"ema_period": 1})", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(ConfigJson, RejectsATurnoverFloorGivenAsANumberNotAString) {
+    // min_turnover_usdt must be a decimal STRING - a bare JSON number with a
+    // fractional part would have to go through a double to reach simdjson's
+    // get_uint64/get_double, reintroducing the rounding error the scaled
+    // integer exists to avoid.
+    std::string error;
+    ParseJson(R"({"min_turnover_usdt": 250000.50})", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(ConfigJsonFile, AnExplicitPathThatCannotBeReadIsFatal) {
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    EXPECT_FALSE(FromArgs({"--config=/nonexistent/screener/config.json"}).has_value());
+}
+
+TEST(ConfigJsonFile, AnExplicitValidFileIsApplied) {
+    const std::string path = WriteTempConfigJson(R"({"ema_period": 30})");
+
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    const auto c = FromArgs({"--config=" + path});
+    std::remove(path.c_str());
+
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->ema_period, 30u);
+}
+
+TEST(ConfigJsonFile, AMalformedExplicitFileIsFatal) {
+    const std::string path = WriteTempConfigJson("{not json");
+
+    ::unsetenv("TELEGRAM_BOT_TOKEN");
+    ::unsetenv("TELEGRAM_CHAT_ID");
+
+    const auto c = FromArgs({"--config=" + path});
+    std::remove(path.c_str());
+
+    EXPECT_FALSE(c.has_value());
+}
+
+TEST(Validate, RejectsASurgeRatioOfOneOrLess) {
+    ScreenerConfig config;
+    config.surge_numerator = 100;
+    config.surge_denominator = 100;
+    EXPECT_FALSE(config.Validate().empty());
 }
 
 }  // namespace screener

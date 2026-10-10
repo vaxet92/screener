@@ -20,7 +20,7 @@ void CoreManager::SetUniverse(const std::vector<Symbol>& symbols) {
 
     for (const Symbol& symbol : symbols) {
         const auto id = static_cast<uint32_t>(state_.size());
-        state_.emplace_back(id, symbol);
+        state_.emplace_back(id, symbol, static_cast<int>(ema_period_));
         id_by_symbol_.emplace(symbol, id);
     }
 }
@@ -129,21 +129,28 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
         return c;
     }
 
-    // recent / prev > 130 / 100, rearranged so there is no division.
+    // recent / prev > surge_numerator_ / surge_denominator_, rearranged so
+    // there is no division.
     //
     // __int128 because the left side reaches ~2.4e16 (24 bars of BTC turnover
-    // at kVolumeScale) and the right side multiplies by 130, giving ~3.1e18.
-    // That is inside int64's 9.2e18, but by only 3x - and the cost of being
-    // wrong is a silent sign flip on the comparison that decides the filter.
-    // One 128-bit multiply per closed bar is not a cost worth that risk.
-    c.surge = static_cast<__int128>(turnover.recent) * kSurgeDenominator >
-              static_cast<__int128>(turnover.prev) * kSurgeNumerator;
+    // at kVolumeScale) and the right side multiplies by up to ~130, giving
+    // ~3.1e18. That is inside int64's 9.2e18, but by only 3x - and the cost of
+    // being wrong is a silent sign flip on the comparison that decides the
+    // filter. One 128-bit multiply per closed bar is not a cost worth that
+    // risk.
+    c.surge = static_cast<__int128>(turnover.recent) * surge_denominator_ >
+              static_cast<__int128>(turnover.prev) * surge_numerator_;
 
     // The one condition that spans both timeframes, and it spans as two
-    // scalar reads: the latest 1h close against the 4h EMA50.
+    // scalar reads: the latest 1h close against the HTF EMA.
     c.trend = ltf.LastClose() > htf.GetEma();
 
-    c.volatility = ltf.GetNatrBp() > kMinNatrBp;
+    c.volatility = ltf.GetNatrBp() > min_natr_bp_;
+
+    // Same recent-window sum the surge condition reads. >= so the default
+    // min_turnover_ = 0 is always satisfied - off until configured
+    // (DESIGN.md §15).
+    c.liquidity = turnover.recent >= min_turnover_;
 
     return c;
 }
@@ -178,8 +185,8 @@ void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
     pending_transitions_.push_back({s.Id(), false});
     // Logged with WHICH condition failed. "INACTIVE" on its own is
     // undiagnosable after the fact, and these transitions are the product.
-    Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={}", s.Name(), c.ready, c.surge, c.trend,
-                c.volatility);
+    Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={} liq={}", s.Name(), c.ready, c.surge,
+                c.trend, c.volatility, c.liquidity);
 }
 
 void CoreManager::RequestRebuild(SymbolTracker& s) {

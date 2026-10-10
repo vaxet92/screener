@@ -70,7 +70,7 @@ TEST(IntMath, SymmetricSoAConstantSignalDoesNotDrift) {
 // ---------------------------------------------------------------------------
 
 TEST(Ema, NotReadyBeforePeriodBars) {
-    Ema<50> ema;
+    Ema ema(50);
     for (int i = 0; i < 49; ++i) {
         ema.Update(P(100.0));
         EXPECT_FALSE(ema.Ready()) << "ready after " << (i + 1) << " bars";
@@ -80,7 +80,7 @@ TEST(Ema, NotReadyBeforePeriodBars) {
 }
 
 TEST(Ema, SeedsWithSimpleMeanOfFirstPeriod) {
-    Ema<4> ema;
+    Ema ema(4);
     ema.Update(P(10.0));
     ema.Update(P(20.0));
     ema.Update(P(30.0));
@@ -90,7 +90,7 @@ TEST(Ema, SeedsWithSimpleMeanOfFirstPeriod) {
 }
 
 TEST(Ema, ConstantSeriesStaysAtThatConstant) {
-    Ema<50> ema;
+    Ema ema(50);
     for (int i = 0; i < 500; ++i) {
         ema.Update(P(1234.5));
     }
@@ -103,7 +103,7 @@ TEST(Ema, MatchesFloatingReferenceWithinTolerance) {
         closes.push_back(100.0 + 10.0 * std::sin(i * 0.1) + 0.01 * i);
     }
 
-    Ema<50> ema;
+    Ema ema(50);
     for (double close : closes) {
         ema.Update(P(close));
     }
@@ -121,7 +121,7 @@ TEST(Ema, MatchesFloatingReferenceWithinTolerance) {
 // The cheapest contracts are the ones a coarse scale would destroy. At
 // kPriceScale = 1e10 a price of 0.000006 still has four significant digits.
 TEST(Ema, WorksAtTheMicroPriceExtreme) {
-    Ema<50> ema;
+    Ema ema(50);
     for (int i = 0; i < 200; ++i) {
         ema.Update(P(0.000006));
     }
@@ -130,7 +130,7 @@ TEST(Ema, WorksAtTheMicroPriceExtreme) {
 }
 
 TEST(Ema, WorksAtBtcScale) {
-    Ema<50> ema;
+    Ema ema(50);
     for (int i = 0; i < 200; ++i) {
         ema.Update(P(95'000.0));
     }
@@ -138,8 +138,31 @@ TEST(Ema, WorksAtBtcScale) {
     EXPECT_EQ(ema.Value(), P(95'000.0));
 }
 
+// `period` moved from a template parameter to a runtime constructor arg
+// (config.json's ema_period, DESIGN.md §15) - this is the test that would
+// catch a leftover hardcoded 50 anywhere in Update/Ready.
+TEST(Ema, WorksAtARuntimePeriodOtherThanFifty) {
+    std::vector<double> closes;
+    for (int i = 0; i < 200; ++i) {
+        closes.push_back(100.0 + 10.0 * std::sin(i * 0.1) + 0.01 * i);
+    }
+
+    Ema ema(10);
+    for (std::size_t i = 0; i < closes.size(); ++i) {
+        ema.Update(P(closes[i]));
+        if (i < 9) {
+            EXPECT_FALSE(ema.Ready()) << "ready after " << (i + 1) << " bars at period 10";
+        }
+    }
+    ASSERT_TRUE(ema.Ready());
+
+    const double expected = EmaReference(closes, 10);
+    const double actual = static_cast<double>(ema.Value()) / static_cast<double>(kPriceScale);
+    EXPECT_NEAR(actual, expected, std::abs(expected) * 1e-6);
+}
+
 TEST(Ema, ResetClearsReadiness) {
-    Ema<4> ema;
+    Ema ema(4);
     for (int i = 0; i < 10; ++i) {
         ema.Update(P(10.0));
     }

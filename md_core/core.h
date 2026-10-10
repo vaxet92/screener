@@ -24,37 +24,38 @@
 
 namespace screener {
 
-// ---------------------------------------------------------------------------
-// Filter thresholds. Integer comparisons only - see DESIGN.md §3.
-// ---------------------------------------------------------------------------
-
-// Volume surge: the recent 24-bar turnover must exceed the previous 24-bar
-// turnover by 30%.
-//
-// Written as `recent * 100 > prev * 130` rather than `recent / prev > 1.3`.
-// Two reasons: no floating point, and no division - a ratio would throw away
-// precision here only for the comparison to reconstruct it, and two
-// nearly-equal windows is exactly where this test decides the answer.
-inline constexpr int64_t kSurgeNumerator = 130;
-inline constexpr int64_t kSurgeDenominator = 100;
-
-// Volatility: NATR must exceed 1.00%, carried in basis points so the
-// comparison is integer.
-inline constexpr int32_t kMinNatrBp = 100;
-
 class CoreManager {
    public:
-    // What the three conditions said for one symbol. Returned (rather than
+    // What the four conditions said for one symbol. Returned (rather than
     // collapsed to a bool) so a transition can be logged with its reason - a
     // wrong verdict is near-impossible to diagnose from "INACTIVE" alone.
     struct Conditions {
         bool ready = false;       // every indicator has enough history
         bool surge = false;       // recent turnover >> previous turnover
-        bool trend = false;       // last 1h close above the 4h EMA50
+        bool trend = false;       // last 1h close above the 4h EMA
         bool volatility = false;  // NATR above the floor
+        bool liquidity = false;   // recent-window turnover above the floor
 
-        bool All() const noexcept { return ready && surge && trend && volatility; }
+        bool All() const noexcept { return ready && surge && trend && volatility && liquidity; }
     };
+
+    // Thresholds moved out of compile-time constants (DESIGN.md §15) so
+    // config.json can set them. Integer comparisons only - see DESIGN.md §3.
+    //
+    //   ema_period          - HTF EMA period (was Ema<kEmaPeriod>)
+    //   surge_numerator/denominator - recent*denominator > prev*numerator
+    //   min_natr_bp         - NATR floor, in basis points
+    //   min_turnover        - liquidity floor, at kVolumeScale, on the same
+    //                         recent-window sum the surge condition reads
+    explicit CoreManager(uint32_t ema_period, int64_t surge_numerator, int64_t surge_denominator,
+                         int32_t min_natr_bp, Volume min_turnover) noexcept
+        : ema_period_(ema_period),
+          surge_numerator_(surge_numerator),
+          surge_denominator_(surge_denominator),
+          min_natr_bp_(min_natr_bp),
+          min_turnover_(min_turnover) {}
+
+    uint32_t EmaPeriod() const noexcept { return ema_period_; }
 
     // Builds the symbol universe. Called once at startup, before any candle.
     // The returned ids are indices into the state vector, and a Candle
@@ -128,6 +129,12 @@ class CoreManager {
     // Recording the id and letting the main loop drain it afterwards costs a
     // push_back and removes the re-entrancy entirely.
     void RequestRebuild(SymbolTracker& s);
+
+    const uint32_t ema_period_;
+    const int64_t surge_numerator_;
+    const int64_t surge_denominator_;
+    const int32_t min_natr_bp_;
+    const Volume min_turnover_;
 
     std::vector<SymbolTracker> state_;
 

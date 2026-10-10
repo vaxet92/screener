@@ -420,9 +420,7 @@ cmake --build build --target md_core
 Running it without Docker:
 
 ```bash
-./build/aggregator/md_core_app     ipc:///tmp/md.ipc --market=spot
-./build/aggregator/md_provider_app binance spot ipc:///tmp/md.ipc
-./build/client/client_app          --market=spot --bbo
+./build/control_manager/screener  --config=config.json --max-symbols=1000 --warmup-bars=800 --topics-per-sub=100 --telegram
 ```
 
 ### Tests

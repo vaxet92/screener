@@ -99,3 +99,4 @@ graph_info.json
 .env
 .env.*
 !.env.example
+config.json
