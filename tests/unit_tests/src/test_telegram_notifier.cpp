@@ -94,7 +94,7 @@ TEST(TelegramNotifier, FirstMessageGoesOutWithoutWaiting) {
     // interval for no reason.
     ASSERT_EQ(sent.size(), 1u);
     EXPECT_NE(sent[0].find("<b>ACTIVE</b> <b>BTCUSDT</b>"), std::string::npos) << sent[0];
-    EXPECT_NE(sent[0].find("Active (2):"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (2):"), std::string::npos) << sent[0];
     // One per line, each bold - this is read on a phone.
     EXPECT_NE(sent[0].find("\n<b>BTCUSDT</b>\n<b>ETHUSDT</b>\n"), std::string::npos) << sent[0];
 }
@@ -109,7 +109,7 @@ TEST(TelegramNotifier, DeactivationNamesTheSymbolAndTheRemainingSet) {
 
     ASSERT_EQ(sent.size(), 1u);
     EXPECT_NE(sent[0].find("<b>INACTIVE</b> <b>SOLUSDT</b>"), std::string::npos) << sent[0];
-    EXPECT_NE(sent[0].find("Active (1):"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (1):"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("<b>BTCUSDT</b>"), std::string::npos) << sent[0];
 }
 
@@ -130,10 +130,10 @@ TEST(TelegramNotifier, StartupMessageExplainsTheReadyGap) {
     // The gap between tracked and ready is stated, not left as a subtraction,
     // and every missing symbol is named with its reason.
     EXPECT_NE(sent[0].find("791 instruments: 789 ready, 2 not ready"), std::string::npos) << sent[0];
-    EXPECT_NE(sent[0].find("Not ready (2):"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("~~~NOT READY~~~ (2):"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("AUSDT - no history"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("NEWUSDT - 12 x 1h"), std::string::npos) << sent[0];
-    EXPECT_NE(sent[0].find("Active (0):"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (0):"), std::string::npos) << sent[0];
 }
 
 TEST(TelegramNotifier, ListsEverySymbolByDefault) {
@@ -231,7 +231,7 @@ TEST(TelegramNotifier, ActiveListIsCappedAndSorted) {
     ASSERT_EQ(sent.size(), 1u);
     // Non-zero cap: the count is still the real one, and the remainder is
     // reported rather than silently missing.
-    EXPECT_NE(sent[0].find("Active (5):"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (5):"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("<b>AAAUSDT</b>\n<b>BBBUSDT</b>\n<b>CCCUSDT</b>\n(+2 more)"), std::string::npos) << sent[0];
 }
 

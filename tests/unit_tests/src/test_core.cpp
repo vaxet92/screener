@@ -355,6 +355,151 @@ TEST(CoreManager, DeactivatesWhenAConditionStopsHolding) {
 }
 
 // ---------------------------------------------------------------------------
+// Transitions - TakeTransitions()
+// ---------------------------------------------------------------------------
+
+// Warmup's internal Evaluate() call activates the symbol directly, so the
+// transition is already pending the moment Warmup returns - no ApplyCandle
+// needed to observe it.
+TEST(CoreManager, ActivatingPushesATransition) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+
+    const auto transitions = core.TakeTransitions();
+    ASSERT_EQ(transitions.size(), 1u);
+    EXPECT_EQ(transitions[0].symbol_id, 0u);
+    EXPECT_TRUE(transitions[0].active);
+}
+
+TEST(CoreManager, DeactivatingPushesATransition) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
+    }
+    core.Warmup(0, history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+    core.TakeTransitions();  // drain the activation from Warmup
+
+    // Collapse in close drops it below the EMA50 and kills the trend
+    // condition.
+    core.ApplyCandle(Bar(0, 300 * kLtfMs, 1.0, 100.0));
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+
+    const auto transitions = core.TakeTransitions();
+    ASSERT_EQ(transitions.size(), 1u);
+    EXPECT_EQ(transitions[0].symbol_id, 0u);
+    EXPECT_FALSE(transitions[0].active);
+}
+
+TEST(CoreManager, TakeTransitionsDrainsNotServicedInline) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
+    }
+    core.Warmup(0, history);
+
+    EXPECT_EQ(core.TakeTransitions().size(), 1u);
+    // And the list is now empty - a second drain must not repeat the work.
+    EXPECT_TRUE(core.TakeTransitions().empty());
+}
+
+// Edge-triggered: a bar that keeps the symbol ACTIVE must not add a second
+// transition on top of the one Warmup already recorded.
+TEST(CoreManager, StayingActiveDoesNotPushATransition) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+    core.TakeTransitions();  // drain the activation from Warmup
+
+    // Next bar keeps every condition holding: still rising, still surging.
+    core.ApplyCandle(Bar(0, 300 * kLtfMs, 400.0, 100.0));
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+
+    EXPECT_TRUE(core.TakeTransitions().empty());
+}
+
+// RequestRebuild force-deactivates inline and bypasses TryDeactivate, so it
+// must record the edge itself - miss it and chat keeps showing a symbol
+// ACTIVE after a gap has already invalidated it.
+TEST(CoreManager, GapForcesInactiveAndPushesATransition) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double close = 100.0 + i;
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, close, turnover));
+    }
+    core.Warmup(0, history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+    core.TakeTransitions();  // drain the activation from Warmup
+
+    core.ApplyCandle(Bar(0, 310 * kLtfMs, 500.0, 500.0));  // gap
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+
+    const auto transitions = core.TakeTransitions();
+    ASSERT_EQ(transitions.size(), 1u);
+    EXPECT_EQ(transitions[0].symbol_id, 0u);
+    EXPECT_FALSE(transitions[0].active);
+}
+
+// A gap on a symbol that was never ACTIVE has nothing to announce.
+TEST(CoreManager, GapOnAnAlreadyInactiveSymbolPushesNoTransition) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.TakeTransitions();  // drain anything Warmup might have recorded
+
+    core.ApplyCandle(Bar(0, 305 * kLtfMs, 100.0, 1.0));  // gap
+    ASSERT_TRUE(core.TrackerAt(0).RebuildPending());
+
+    EXPECT_TRUE(core.TakeTransitions().empty());
+}
+
+TEST(CoreManager, SetUniverseClearsPendingTransitions) {
+    CoreManager core;
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        const double turnover = i >= 276 ? 100.0 : 1.0;
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, turnover));
+    }
+    core.Warmup(0, history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());  // transition pending, not yet drained
+
+    core.SetUniverse({"BTCUSDT"});
+
+    EXPECT_TRUE(core.TakeTransitions().empty());
+}
+
+// ---------------------------------------------------------------------------
 // Determinism
 // ---------------------------------------------------------------------------
 

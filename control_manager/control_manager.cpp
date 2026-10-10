@@ -330,12 +330,17 @@ void ControlManager::PostRebuildDrain() {
 void ControlManager::DrainRebuilds() {
     rebuild_drain_posted_ = false;
 
-    // DRILL, not yet wired: the ACTIVE/INACTIVE notifications are drained
-    // HERE too, right after the rebuild list, once CoreManager::TakeTransitions()
-    // exists (DESIGN.md §14). This is the drain point because it already runs
-    // AFTER the ApplyCandle call has returned - sending from inside
-    // TryActivate would put chat formatting on the message path and give
-    // md_core a dependency on network I/O.
+    // Drained HERE, next to the rebuild list, because this already runs
+    // AFTER the ApplyCandle call has returned (it is `post`ed) - sending from
+    // inside TryActivate would put chat formatting and a URL-encode on the
+    // message path and give md_core a dependency on network I/O.
+    for (const auto& t : core_.TakeTransitions()) {
+        if (t.active) {
+            notifier_.NotifyActivated(core_.NameOf(t.symbol_id), core_.ActiveInstruments());
+        } else {
+            notifier_.NotifyDeactivated(core_.NameOf(t.symbol_id), core_.ActiveInstruments());
+        }
+    }
 
     const std::vector<uint32_t> pending = core_.TakePendingRebuilds();
     for (const uint32_t id : pending) {

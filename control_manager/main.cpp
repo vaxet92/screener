@@ -13,7 +13,7 @@ int main(int argc, char* argv[]) {
     // ACTIVE/INACTIVE transitions appear in late bursts, or are lost entirely
     // if the process is killed. The transitions ARE the product, so they are
     // worth one flush per line.
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
 
     const auto config = screener::ScreenerConfig::FromArgs(argc, argv);
     if (!config) {

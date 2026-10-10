@@ -87,6 +87,22 @@ class CoreManager {
     // loop after each frame, never serviced inline - see RequestRebuild().
     std::vector<uint32_t> TakePendingRebuilds();
 
+    // One ACTIVE/INACTIVE edge. `active` is the state the symbol just
+    // entered, not merely "something changed" - the notifier formats a
+    // different message for each direction.
+    struct Transition {
+        uint32_t symbol_id;
+        bool active;
+    };
+
+    // Transitions since the last drain. Swap-out, same shape as
+    // TakePendingRebuilds() - drained by ControlManager::DrainRebuilds,
+    // which already runs after ApplyCandle has returned. Formatting a chat
+    // message and URL-encoding it from inside TryActivate would put network
+    // I/O on the message path, so this only RECORDS the edge; sending it is
+    // the caller's job.
+    std::vector<Transition> TakeTransitions();
+
     const std::unordered_set<Symbol>& ActiveInstruments() const noexcept { return active_instruments_; }
 
     // Evaluate without mutating, for tests and for the console table.
@@ -123,6 +139,7 @@ class CoreManager {
     std::unordered_set<Symbol> active_instruments_;
 
     std::vector<uint32_t> pending_rebuilds_;
+    std::vector<Transition> pending_transitions_;
 };
 
 }  // namespace screener

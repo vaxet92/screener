@@ -9,6 +9,7 @@ void CoreManager::SetUniverse(const std::vector<Symbol>& symbols) {
     id_by_symbol_.clear();
     active_instruments_.clear();
     pending_rebuilds_.clear();
+    pending_transitions_.clear();
 
     // reserve() before the loop matters more than it looks: SymbolTracker
     // holds two CandleTrackers with deques inside, so a vector reallocation
@@ -162,6 +163,7 @@ void CoreManager::TryActivate(SymbolTracker& s, const Conditions& c) {
     }
     s.SetActive(true);
     active_instruments_.insert(s.Name());
+    pending_transitions_.push_back({s.Id(), true});
     Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} natr={}bp turnover_recent={} prev={}", s.Name(),
                 s.Ltf().LastClose(), s.Htf().GetEma(), s.Ltf().GetNatrBp(), c.surge ? s.Ltf().Turnover().recent : 0,
                 c.surge ? s.Ltf().Turnover().prev : 0);
@@ -173,6 +175,7 @@ void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
     }
     s.SetActive(false);
     active_instruments_.erase(s.Name());
+    pending_transitions_.push_back({s.Id(), false});
     // Logged with WHICH condition failed. "INACTIVE" on its own is
     // undiagnosable after the fact, and these transitions are the product.
     Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={}", s.Name(), c.ready, c.surge, c.trend,
@@ -190,6 +193,10 @@ void CoreManager::RequestRebuild(SymbolTracker& s) {
     if (s.IsActive()) {
         s.SetActive(false);
         active_instruments_.erase(s.Name());
+        // This bypasses TryDeactivate, so the edge is recorded here instead -
+        // miss it and chat keeps showing a symbol ACTIVE after a gap has
+        // already invalidated it.
+        pending_transitions_.push_back({s.Id(), false});
     }
 
     s.SetRebuildPending(true);
@@ -201,6 +208,12 @@ void CoreManager::RequestRebuild(SymbolTracker& s) {
 std::vector<uint32_t> CoreManager::TakePendingRebuilds() {
     std::vector<uint32_t> out;
     out.swap(pending_rebuilds_);
+    return out;
+}
+
+std::vector<CoreManager::Transition> CoreManager::TakeTransitions() {
+    std::vector<Transition> out;
+    out.swap(pending_transitions_);
     return out;
 }
 
