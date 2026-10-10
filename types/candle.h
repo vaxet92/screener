@@ -52,7 +52,7 @@ enum class TimeFrame : uint8_t {
 inline constexpr int64_t kLtfMs = 3'600'000;   // 1h
 inline constexpr int64_t kHtfMs = 4 * kLtfMs;  // 4h
 inline constexpr int kLtfBarsPerHtf = 4;
-inline constexpr int64_t kFastMs = 300'000;    // 5m
+inline constexpr int64_t kFastMs = 300'000;  // 5m
 
 struct Candle {
     int64_t open_time_ms;          //  8  IDENTITY: dedup, gap detection, HTF alignment
@@ -61,10 +61,10 @@ struct Candle {
     Volume turnover;               //  8  int64, x kVolumeScale
     uint32_t symbol_id;            //  4  index into CoreManager's state vector
     TimeFrame timeframe;           //  1  which WS topic this bar closed on - plus 3 bytes
-                                    //     of ordinary compiler padding, no longer named
-                                    //     `reserved_`: it is read now, by the live-frame
-                                    //     dispatch that routes a Candle to ApplyCandle or
-                                    //     ApplyFastCandle (DESIGN.md §16).
+                                   //     of ordinary compiler padding, no longer named
+                                   //     `reserved_`: it is read now, by the live-frame
+                                   //     dispatch that routes a Candle to ApplyCandle or
+                                   //     ApplyFastCandle (DESIGN.md §16).
 };
 
 // Trivially copyable is what lets this be memcpy'd into a ring buffer in

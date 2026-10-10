@@ -284,7 +284,7 @@ TEST(ConfigJson, LeavesUnmentionedFieldsAtTheCompiledDefault) {
 
     EXPECT_TRUE(error.empty()) << error;
     EXPECT_EQ(c.ema_period, 20u);
-    EXPECT_EQ(c.surge_numerator, 130);   // unmentioned: compiled default
+    EXPECT_EQ(c.surge_numerator, 130);    // unmentioned: compiled default
     EXPECT_EQ(c.surge_denominator, 100);  // unmentioned: compiled default
 }
 

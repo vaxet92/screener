@@ -23,9 +23,10 @@ std::string KlineFrame(const char* symbol, int64_t start, bool confirm, const ch
                        const char* interval = "60") {
     return std::string(R"({"topic":"kline.)") + interval + "." + symbol + R"(","data":[{"start":)" +
            std::to_string(start) + R"(,"end":)" + std::to_string(start + 3'599'999) + R"(,"interval":")" + interval +
-           R"(","open":"100.5","close":")" + close + R"(","high":"110.25","low":"99.5","volume":"123.45","turnover":")" +
-           turnover + R"(","confirm":)" + (confirm ? "true" : "false") + R"(,"timestamp":)" +
-           std::to_string(start + 1000) + R"(}],"ts":)" + std::to_string(start + 3'600'000) + R"(,"type":"snapshot"})";
+           R"(","open":"100.5","close":")" + close +
+           R"(","high":"110.25","low":"99.5","volume":"123.45","turnover":")" + turnover + R"(","confirm":)" +
+           (confirm ? "true" : "false") + R"(,"timestamp":)" + std::to_string(start + 1000) + R"(}],"ts":)" +
+           std::to_string(start + 3'600'000) + R"(,"type":"snapshot"})";
 }
 
 }  // namespace
@@ -77,8 +78,7 @@ TEST(BybitParser, TagsTheFastStreamFromItsTopic) {
     const auto ids = Ids();
     std::vector<Candle> out;
 
-    ASSERT_TRUE(
-        parser.ParseKlineFrame(KlineFrame("BTCUSDT", 1'700'000'000'000, true, "105", "1", "5"), ids, out));
+    ASSERT_TRUE(parser.ParseKlineFrame(KlineFrame("BTCUSDT", 1'700'000'000'000, true, "105", "1", "5"), ids, out));
 
     ASSERT_EQ(out.size(), 1u);
     EXPECT_EQ(out[0].timeframe, TimeFrame::kM5);
@@ -242,7 +242,8 @@ TEST(BybitParser, RestKlineTagsTheRequestedTimeframe) {
 TEST(BybitParser, RestKlineRejectsNonZeroRetCode) {
     BybitParser parser;
     std::vector<Candle> out;
-    EXPECT_FALSE(parser.ParseRestKline(R"({"retCode":10006,"retMsg":"too frequent","result":{}})", 0, TimeFrame::kH1, out));
+    EXPECT_FALSE(
+        parser.ParseRestKline(R"({"retCode":10006,"retMsg":"too frequent","result":{}})", 0, TimeFrame::kH1, out));
 }
 
 // ---------------------------------------------------------------------------
