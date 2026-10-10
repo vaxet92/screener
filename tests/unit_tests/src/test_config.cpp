@@ -338,8 +338,8 @@ TEST(ConfigJson, RejectsATurnoverFloorGivenAsANumberNotAString) {
 }
 
 TEST(ConfigJsonFile, AnExplicitPathThatCannotBeReadIsFatal) {
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     EXPECT_FALSE(FromArgs({"--config=/nonexistent/screener/config.json"}).has_value());
 }
@@ -347,8 +347,8 @@ TEST(ConfigJsonFile, AnExplicitPathThatCannotBeReadIsFatal) {
 TEST(ConfigJsonFile, AnExplicitValidFileIsApplied) {
     const std::string path = WriteTempConfigJson(R"({"ema_period": 30})");
 
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     const auto c = FromArgs({"--config=" + path});
     std::remove(path.c_str());
@@ -360,8 +360,8 @@ TEST(ConfigJsonFile, AnExplicitValidFileIsApplied) {
 TEST(ConfigJsonFile, AMalformedExplicitFileIsFatal) {
     const std::string path = WriteTempConfigJson("{not json");
 
-    ::unsetenv("TELEGRAM_BOT_TOKEN");
-    ::unsetenv("TELEGRAM_CHAT_ID");
+    UnsetEnvVar("TELEGRAM_BOT_TOKEN");
+    UnsetEnvVar("TELEGRAM_CHAT_ID");
 
     const auto c = FromArgs({"--config=" + path});
     std::remove(path.c_str());
