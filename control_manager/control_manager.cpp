@@ -382,10 +382,27 @@ void ControlManager::DrainRebuilds() {
     // inside TryActivate would put chat formatting and a URL-encode on the
     // message path and give md_core a dependency on network I/O.
     for (const auto& t : core_.TakeTransitions()) {
+        TelegramNotifier::TransitionDetail detail;
+        detail.ready = t.conditions.ready;
+        detail.surge = t.conditions.surge;
+        detail.trend = t.conditions.trend;
+        detail.volatility = t.conditions.volatility;
+        detail.liquidity = t.conditions.liquidity;
+        detail.gap = t.gap;
+        detail.last_close = t.last_close;
+        detail.ema50 = t.ema50;
+        detail.natr_bp = t.natr_bp;
+        detail.turnover_recent = t.turnover_recent;
+        detail.turnover_prev = t.turnover_prev;
+        detail.surge_numerator = core_.SurgeNumerator();
+        detail.surge_denominator = core_.SurgeDenominator();
+        detail.min_natr_bp = core_.MinNatrBp();
+        detail.min_turnover = core_.MinTurnover();
+
         if (t.active) {
-            notifier_.NotifyActivated(core_.NameOf(t.symbol_id), core_.ActiveInstruments());
+            notifier_.NotifyActivated(core_.NameOf(t.symbol_id), detail, core_.ActiveInstruments());
         } else {
-            notifier_.NotifyDeactivated(core_.NameOf(t.symbol_id), core_.ActiveInstruments());
+            notifier_.NotifyDeactivated(core_.NameOf(t.symbol_id), detail, core_.ActiveInstruments());
         }
     }
 

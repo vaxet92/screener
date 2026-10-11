@@ -47,6 +47,29 @@ std::unordered_set<Symbol> ActiveSet(std::initializer_list<const char*> names) {
     return out;
 }
 
+// A TransitionDetail with every condition passing - what TryActivate's
+// snapshot looks like on a real ACTIVATE edge. Tests that only care about the
+// symbol/active-list formatting use this as-is; tests that care about the
+// condition text build their own.
+TelegramNotifier::TransitionDetail ActiveDetail() {
+    TelegramNotifier::TransitionDetail d;
+    d.ready = true;
+    d.surge = true;
+    d.trend = true;
+    d.volatility = true;
+    d.liquidity = true;
+    d.last_close = 110 * kPriceScale;
+    d.ema50 = 100 * kPriceScale;
+    d.natr_bp = 150;
+    d.turnover_recent = 500'000 * kVolumeScale;
+    d.turnover_prev = 300'000 * kVolumeScale;
+    d.surge_numerator = 130;
+    d.surge_denominator = 100;
+    d.min_natr_bp = 100;
+    d.min_turnover = 0;
+    return d;
+}
+
 // Runs the io_context until it has no work left, with a wall-clock bound so a
 // stuck timer fails the test instead of hanging the suite.
 void RunUntilIdle(boost::asio::io_context& ioc) {
@@ -65,7 +88,7 @@ TEST(TelegramNotifier, DisabledWithoutTheFlag) {
     TelegramNotifier n(ioc, c, [&sent](const std::string& t) { sent.push_back(t); });
 
     EXPECT_FALSE(n.Enabled());
-    n.NotifyActivated("BTCUSDT", ActiveSet({"BTCUSDT"}));
+    n.NotifyActivated("BTCUSDT", ActiveDetail(), ActiveSet({"BTCUSDT"}));
     RunUntilIdle(ioc);
 
     // Not an error, not a queued message: a run without --telegram behaves
@@ -87,16 +110,24 @@ TEST(TelegramNotifier, FirstMessageGoesOutWithoutWaiting) {
     std::vector<std::string> sent;
     TelegramNotifier n(ioc, EnabledConfig(), [&sent](const std::string& t) { sent.push_back(t); });
 
-    n.NotifyActivated("BTCUSDT", ActiveSet({"BTCUSDT", "ETHUSDT"}));
+    n.NotifyActivated("BTCUSDT", ActiveDetail(), ActiveSet({"BTCUSDT", "ETHUSDT"}));
 
     // Before the io_context has run at all. The pacing timer delays the
     // messages BEHIND the first one; a lone transition must not wait an
     // interval for no reason.
     ASSERT_EQ(sent.size(), 1u);
-    EXPECT_NE(sent[0].find("<b>ACTIVE</b> <b>BTCUSDT</b>"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("<b>ACTIVE</b>: <b>BTCUSDT</b>"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (2):"), std::string::npos) << sent[0];
     // One per line, each bold - this is read on a phone.
     EXPECT_NE(sent[0].find("\n<b>BTCUSDT</b>\n<b>ETHUSDT</b>\n"), std::string::npos) << sent[0];
+    // The TradingView link and the four condition lines are now part of
+    // every ACTIVE message.
+    EXPECT_NE(sent[0].find("tradingview.com/chart/?symbol=BYBIT:BTCUSDT.P&amp;interval=60"), std::string::npos)
+        << sent[0];
+    EXPECT_NE(sent[0].find("Trend:"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("Volume surge:"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("Volatility:"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("Liquidity:"), std::string::npos) << sent[0];
 }
 
 TEST(TelegramNotifier, DeactivationNamesTheSymbolAndTheRemainingSet) {
@@ -104,13 +135,20 @@ TEST(TelegramNotifier, DeactivationNamesTheSymbolAndTheRemainingSet) {
     std::vector<std::string> sent;
     TelegramNotifier n(ioc, EnabledConfig(), [&sent](const std::string& t) { sent.push_back(t); });
 
-    n.NotifyDeactivated("SOLUSDT", ActiveSet({"BTCUSDT"}));
+    TelegramNotifier::TransitionDetail detail = ActiveDetail();
+    detail.surge = false;  // the one condition that broke
+
+    n.NotifyDeactivated("SOLUSDT", detail, ActiveSet({"BTCUSDT"}));
     RunUntilIdle(ioc);
 
     ASSERT_EQ(sent.size(), 1u);
-    EXPECT_NE(sent[0].find("<b>INACTIVE</b> <b>SOLUSDT</b>"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("<b>INACTIVE</b>: <b>SOLUSDT</b>"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("~~~ACTIVE~~~ (1):"), std::string::npos) << sent[0];
     EXPECT_NE(sent[0].find("<b>BTCUSDT</b>"), std::string::npos) << sent[0];
+    // The REASON line names which condition broke and the threshold it
+    // missed, not just "INACTIVE".
+    EXPECT_NE(sent[0].find("REASON: Volume surge"), std::string::npos) << sent[0];
+    EXPECT_NE(sent[0].find("needs >30%"), std::string::npos) << sent[0];
 }
 
 TEST(TelegramNotifier, StartupMessageExplainsTheReadyGap) {
@@ -146,7 +184,7 @@ TEST(TelegramNotifier, ListsEverySymbolByDefault) {
         active.emplace("SYM" + std::to_string(i) + "USDT");
     }
 
-    n.NotifyActivated("SYM0USDT", active);
+    n.NotifyActivated("SYM0USDT", ActiveDetail(), active);
     RunUntilIdle(ioc);
 
     // telegram_active_list_max defaults to 0 = all. No "+N more" anywhere.
@@ -172,7 +210,7 @@ TEST(TelegramNotifier, SplitsAnOversizedListAcrossMessages) {
         active.emplace("SYMBOL" + std::to_string(i) + "USDT");
     }
 
-    n.NotifyActivated("SYMBOL0USDT", active);
+    n.NotifyActivated("SYMBOL0USDT", ActiveDetail(), active);
     RunUntilIdle(ioc);
 
     ASSERT_GT(sent.size(), 1u);
@@ -208,7 +246,7 @@ TEST(TelegramNotifier, EscapesHtmlInText) {
     // Not a real ticker, but parse_mode=HTML means any unescaped '<' in a
     // dynamic value is a 400 - and the whole point of HTML over MarkdownV2 is
     // that there are only three characters to get right.
-    n.NotifyActivated("A&B<C>", ActiveSet({}));
+    n.NotifyActivated("A&B<C>", ActiveDetail(), ActiveSet({}));
     RunUntilIdle(ioc);
 
     ASSERT_EQ(sent.size(), 1u);
@@ -225,7 +263,7 @@ TEST(TelegramNotifier, ActiveListIsCappedAndSorted) {
 
     // Telegram rejects a message over 4096 characters, so the full set is
     // counted but not listed.
-    n.NotifyActivated("AAAUSDT", ActiveSet({"DDDUSDT", "BBBUSDT", "AAAUSDT", "CCCUSDT", "EEEUSDT"}));
+    n.NotifyActivated("AAAUSDT", ActiveDetail(), ActiveSet({"DDDUSDT", "BBBUSDT", "AAAUSDT", "CCCUSDT", "EEEUSDT"}));
     RunUntilIdle(ioc);
 
     ASSERT_EQ(sent.size(), 1u);
@@ -242,9 +280,9 @@ TEST(TelegramNotifier, PacesABurstInOrder) {
 
     // The shape of a real hourly close: several symbols flip inside the same
     // handler, long before the io_context gets to run again.
-    n.NotifyActivated("AAAUSDT", ActiveSet({"AAAUSDT"}));
-    n.NotifyActivated("BBBUSDT", ActiveSet({"AAAUSDT", "BBBUSDT"}));
-    n.NotifyActivated("CCCUSDT", ActiveSet({"AAAUSDT", "BBBUSDT", "CCCUSDT"}));
+    n.NotifyActivated("AAAUSDT", ActiveDetail(), ActiveSet({"AAAUSDT"}));
+    n.NotifyActivated("BBBUSDT", ActiveDetail(), ActiveSet({"AAAUSDT", "BBBUSDT"}));
+    n.NotifyActivated("CCCUSDT", ActiveDetail(), ActiveSet({"AAAUSDT", "BBBUSDT", "CCCUSDT"}));
 
     EXPECT_EQ(sent.size(), 1u);  // one sent, two queued
     EXPECT_EQ(n.QueueDepth(), 2u);
@@ -266,10 +304,10 @@ TEST(TelegramNotifier, DropsPastTheQueueCapAndReportsTheLoss) {
     c.telegram_max_queue = 1;
     TelegramNotifier n(ioc, c, [&sent](const std::string& t) { sent.push_back(t); });
 
-    n.NotifyActivated("AAAUSDT", ActiveSet({"AAAUSDT"}));  // sent immediately
-    n.NotifyActivated("BBBUSDT", ActiveSet({"BBBUSDT"}));  // fills the queue
-    n.NotifyActivated("CCCUSDT", ActiveSet({"CCCUSDT"}));  // dropped
-    n.NotifyActivated("DDDUSDT", ActiveSet({"DDDUSDT"}));  // dropped
+    n.NotifyActivated("AAAUSDT", ActiveDetail(), ActiveSet({"AAAUSDT"}));  // sent immediately
+    n.NotifyActivated("BBBUSDT", ActiveDetail(), ActiveSet({"BBBUSDT"}));  // fills the queue
+    n.NotifyActivated("CCCUSDT", ActiveDetail(), ActiveSet({"CCCUSDT"}));  // dropped
+    n.NotifyActivated("DDDUSDT", ActiveDetail(), ActiveSet({"DDDUSDT"}));  // dropped
 
     EXPECT_EQ(n.Dropped(), 2u);
 
@@ -288,8 +326,8 @@ TEST(TelegramNotifier, StopAbandonsTheQueue) {
     std::vector<std::string> sent;
     TelegramNotifier n(ioc, EnabledConfig(), [&sent](const std::string& t) { sent.push_back(t); });
 
-    n.NotifyActivated("AAAUSDT", ActiveSet({"AAAUSDT"}));
-    n.NotifyActivated("BBBUSDT", ActiveSet({"BBBUSDT"}));
+    n.NotifyActivated("AAAUSDT", ActiveDetail(), ActiveSet({"AAAUSDT"}));
+    n.NotifyActivated("BBBUSDT", ActiveDetail(), ActiveSet({"BBBUSDT"}));
     n.Stop();
 
     RunUntilIdle(ioc);
@@ -318,7 +356,7 @@ TEST(TelegramNotifier, AFailedSendNeverLogsTheBotToken) {
     ASSERT_TRUE(notifier.Enabled());
 
     ::testing::internal::CaptureStdout();
-    notifier.NotifyActivated("BTCUSDT", ActiveSet({"BTCUSDT"}));
+    notifier.NotifyActivated("BTCUSDT", ActiveDetail(), ActiveSet({"BTCUSDT"}));
     RunUntilIdle(ioc);
     const std::string logged = ::testing::internal::GetCapturedStdout();
 

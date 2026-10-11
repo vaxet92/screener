@@ -218,13 +218,33 @@ void CoreManager::Evaluate(SymbolTracker& s) {
     }
 }
 
+CoreManager::Transition CoreManager::SnapshotTransition(const SymbolTracker& s, bool active, const Conditions& c,
+                                                        bool gap) const {
+    Transition t{};
+    t.symbol_id = s.Id();
+    t.active = active;
+    t.conditions = c;
+    t.gap = gap;
+    t.last_close = s.Fast().LastClose();
+    t.ema50 = s.Htf().GetEma();
+    t.natr_bp = s.Ltf().GetNatrBp();
+    const auto turnover = s.Fast().Turnover();
+    t.turnover_recent = turnover.recent;
+    t.turnover_prev = turnover.prev;
+    return t;
+}
+
 void CoreManager::TryActivate(SymbolTracker& s) {
     if (s.IsActive()) {
         return;  // edge-triggered: already active, nothing to announce
     }
     s.SetActive(true);
     active_instruments_.insert(s.Name());
-    pending_transitions_.push_back({s.Id(), true});
+    // Every condition is true by construction here (Evaluate() only calls
+    // this when c.All() holds) - the explicit Conditions is just the
+    // snapshot the notifier reads back, not a re-check.
+    pending_transitions_.push_back(
+        SnapshotTransition(s, true, Conditions{true, true, true, true, true}, /*gap=*/false));
     Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} natr={}bp turnover_recent={} prev={}", s.Name(),
                 s.Fast().LastClose(), s.Htf().GetEma(), s.Ltf().GetNatrBp(), s.Fast().Turnover().recent,
                 s.Fast().Turnover().prev);
@@ -236,7 +256,7 @@ void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
     }
     s.SetActive(false);
     active_instruments_.erase(s.Name());
-    pending_transitions_.push_back({s.Id(), false});
+    pending_transitions_.push_back(SnapshotTransition(s, false, c, /*gap=*/false));
     // Logged with WHICH condition failed. "INACTIVE" on its own is
     // undiagnosable after the fact, and these transitions are the product.
     Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={} liq={}", s.Name(), c.ready, c.surge,
@@ -256,8 +276,9 @@ void CoreManager::RequestRebuild(SymbolTracker& s) {
         active_instruments_.erase(s.Name());
         // This bypasses TryDeactivate, so the edge is recorded here instead -
         // miss it and chat keeps showing a symbol ACTIVE after a gap has
-        // already invalidated it.
-        pending_transitions_.push_back({s.Id(), false});
+        // already invalidated it. gap=true: this is not a filter failure, so
+        // the notifier must say "data gap", not list four broken conditions.
+        pending_transitions_.push_back(SnapshotTransition(s, false, Conditions{}, /*gap=*/true));
     }
 
     s.SetRebuildPending(true);
