@@ -1,8 +1,11 @@
 #include "notifier/telegram_notifier.h"
 
+#include <fmt/chrono.h>
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <utility>
 #include <vector>
 
@@ -77,6 +80,128 @@ std::string Bold(std::string_view in) {
 // difference between characters and the UTF-16 code units Telegram actually
 // counts: an emoji is one character here and two there.
 inline constexpr std::size_t kMaxMessageChars = 3800;
+
+// UTC, minute resolution - every message gets one line of this, so
+// microsecond precision (Logger::Timestamp()) would just be noise an
+// operator reading chat on a phone has to skip past.
+std::string FormatUtcTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    return fmt::format("\xF0\x9F\x95\x92 {:%Y-%m-%d %H:%M} UTC",
+                       fmt::gmtime(std::chrono::system_clock::to_time_t(now)));
+}
+
+// Magnitude only, two decimal places, from a basis-point integer - no
+// division that would need a float. Used for NATR (always >= 0) and for the
+// EMA distance, where the caller supplies the direction word separately.
+std::string FormatPercentBp(int64_t bp) {
+    const int64_t abs_bp = bp < 0 ? -bp : bp;
+    return fmt::format("{}.{:02}%", abs_bp / 100, abs_bp % 100);
+}
+
+// Signed whole percent - the surge condition has no fractional threshold, so
+// a whole number reads cleaner than two decimals that are never meaningful.
+std::string FormatSignedPercent(int64_t pct) {
+    return fmt::format("{}{}%", pct >= 0 ? "+" : "", pct);
+}
+
+// Basis points of (close - ema) relative to ema. __int128 for the same
+// reason CoreManager's surge comparison uses it: diff * 10000 reaches ~1e19
+// at BTC scale, which overflows int64 by a small enough margin that it is
+// worth not risking.
+int64_t TrendBp(Price close, Price ema) {
+    if (ema == 0) {
+        return 0;
+    }
+    const __int128 diff = static_cast<__int128>(close - ema) * 10000;
+    return static_cast<int64_t>(diff / ema);
+}
+
+// Whole percent change of recent vs prev turnover, same 128-bit rationale.
+int64_t SurgePercent(Volume recent, Volume prev) {
+    if (prev == 0) {
+        return 0;
+    }
+    const __int128 ratio = static_cast<__int128>(recent) * 100;
+    return static_cast<int64_t>(ratio / prev) - 100;
+}
+
+// "$412,300" - grouped, no locale dependency (fmt's "{:L}" pulls in the
+// global locale, which is one more thing to get wrong on a box that never
+// sets LC_NUMERIC).
+std::string FormatUsd(int64_t amount) {
+    const std::string digits = fmt::format("{}", amount < 0 ? -amount : amount);
+    std::string grouped;
+    for (std::size_t i = 0; i < digits.size(); ++i) {
+        if (i != 0 && (digits.size() - i) % 3 == 0) {
+            grouped.push_back(',');
+        }
+        grouped.push_back(digits[i]);
+    }
+    return fmt::format("${}{}", amount < 0 ? "-" : "", grouped);
+}
+
+// The four condition lines, with current values - shown on BOTH ACTIVE and
+// INACTIVE messages, so the chat always carries "why", not just "what".
+std::string FormatConditionBlock(const TelegramNotifier::TransitionDetail& d) {
+    if (!d.gap && !d.ready) {
+        return "\xE2\x8F\xB3 Not enough history yet (warming up)\n";
+    }
+
+    const int64_t trend_bp = TrendBp(d.last_close, d.ema50);
+    const int64_t surge_pct = SurgePercent(d.turnover_recent, d.turnover_prev);
+
+    return fmt::format(
+        "\xF0\x9F\x93\x8A Trend: {} {} EMA50\n"
+        "\xF0\x9F\x93\x88 Volume surge: {}\n"
+        "\xF0\x9F\x8C\x8A Volatility: NATR {}\n"
+        "\xF0\x9F\x92\xA7 Liquidity: {}\n",
+        FormatPercentBp(trend_bp), trend_bp >= 0 ? "above" : "below", FormatSignedPercent(surge_pct),
+        FormatPercentBp(d.natr_bp), FormatUsd(d.turnover_recent / kVolumeScale));
+}
+
+// Deactivate-only: WHICH condition(s) broke, against which threshold. A gap
+// is not a filter failure, and "not ready" has no threshold to report - both
+// get their own one-line reason instead of a condition list.
+std::string FormatReason(const TelegramNotifier::TransitionDetail& d) {
+    if (d.gap) {
+        return "\xE2\x9A\xA0 REASON: data gap detected - rebuilding from REST\n";
+    }
+    if (!d.ready) {
+        return "\xE2\x9A\xA0 REASON: not enough history yet\n";
+    }
+
+    std::vector<std::string> failed;
+    if (!d.surge) {
+        const int64_t surge_pct = SurgePercent(d.turnover_recent, d.turnover_prev);
+        const int64_t needed_pct = (d.surge_numerator * 100) / d.surge_denominator - 100;
+        failed.push_back(fmt::format("Volume surge {} (needs >{}%)", FormatSignedPercent(surge_pct), needed_pct));
+    }
+    if (!d.trend) {
+        const int64_t trend_bp = TrendBp(d.last_close, d.ema50);
+        failed.push_back(fmt::format("Trend: price {} below EMA50 (needs above)", FormatPercentBp(trend_bp)));
+    }
+    if (!d.volatility) {
+        failed.push_back(
+            fmt::format("Volatility NATR {} (needs >{})", FormatPercentBp(d.natr_bp), FormatPercentBp(d.min_natr_bp)));
+    }
+    if (!d.liquidity) {
+        failed.push_back(fmt::format("Liquidity {} (needs \xE2\x89\xA5{})", FormatUsd(d.turnover_recent / kVolumeScale),
+                                     FormatUsd(d.min_turnover / kVolumeScale)));
+    }
+    if (failed.empty()) {
+        return "";  // All() true would mean TryDeactivate was never called
+    }
+
+    std::string out = "\xE2\x9A\xA0 REASON: ";
+    for (std::size_t i = 0; i < failed.size(); ++i) {
+        if (i != 0) {
+            out += "; ";
+        }
+        out += failed[i];
+    }
+    out.push_back('\n');
+    return out;
+}
 
 }  // namespace
 
@@ -158,18 +283,24 @@ void TelegramNotifier::NotifyStarted(const StartupReport& report, const std::uno
     Enqueue(std::move(text));
 }
 
-void TelegramNotifier::NotifyActivated(const Symbol& symbol, const std::unordered_set<Symbol>& active) {
+void TelegramNotifier::NotifyActivated(const Symbol& symbol, const TransitionDetail& detail,
+                                       const std::unordered_set<Symbol>& active) {
     if (!enabled_) {
         return;
     }
-    Enqueue(fmt::format("\xF0\x9F\x9F\xA2 {} {}\n\n{}", Bold("ACTIVE"), Bold(symbol), FormatActive(active)));
+    const std::string link =
+        HtmlEscape(fmt::format("https://www.tradingview.com/chart/?symbol=BYBIT:{}.P&interval=60", symbol));
+    Enqueue(fmt::format("\xF0\x9F\x9F\xA2 {}: {}\n\n\xF0\x9F\x93\x88 {}\n\n{}\n{}", Bold("ACTIVE"), Bold(symbol), link,
+                        FormatConditionBlock(detail), FormatActive(active)));
 }
 
-void TelegramNotifier::NotifyDeactivated(const Symbol& symbol, const std::unordered_set<Symbol>& active) {
+void TelegramNotifier::NotifyDeactivated(const Symbol& symbol, const TransitionDetail& detail,
+                                         const std::unordered_set<Symbol>& active) {
     if (!enabled_) {
         return;
     }
-    Enqueue(fmt::format("\xF0\x9F\x94\xB4 {} {}\n\n{}", Bold("INACTIVE"), Bold(symbol), FormatActive(active)));
+    Enqueue(fmt::format("\xF0\x9F\x94\xB4 {}: {}\n\n{}{}\n{}", Bold("INACTIVE"), Bold(symbol),
+                        FormatConditionBlock(detail), FormatReason(detail), FormatActive(active)));
 }
 
 void TelegramNotifier::SendText(std::string text) {
@@ -219,6 +350,11 @@ std::string TelegramNotifier::FormatActive(const std::unordered_set<Symbol>& act
 }
 
 void TelegramNotifier::Enqueue(std::string text) {
+    // Prepended ONCE, here, so every message - NotifyStarted, a transition,
+    // the dropped-notification warning - carries the same UTC header without
+    // each call site formatting its own.
+    text = FormatUtcTimestamp() + "\n" + text;
+
     std::string_view rest(text);
 
     while (!rest.empty()) {
@@ -283,7 +419,7 @@ void TelegramNotifier::PumpQueue() {
         if (dropped_pending_ != 0) {
             const std::size_t dropped = dropped_pending_;
             dropped_pending_ = 0;
-            Push(fmt::format("\xE2\x9A\xA0 {} notification(s) dropped (rate limit)", dropped));
+            Enqueue(fmt::format("\xE2\x9A\xA0 {} notification(s) dropped (rate limit)", dropped));
         }
         return;
     }

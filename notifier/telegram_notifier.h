@@ -72,9 +72,37 @@ class TelegramNotifier {
         std::vector<std::string> not_ready;
     };
 
+    // Everything a message needs to explain ONE transition: the condition
+    // snapshot taken at the edge (CoreManager::Transition), plus the
+    // thresholds those conditions were compared against - copied out of
+    // CoreManager::Transition/CoreManager rather than handed a reference to
+    // either, so this class has no dependency on md_core's types beyond
+    // Price/Volume.
+    struct TransitionDetail {
+        bool ready = false;
+        bool surge = false;
+        bool trend = false;
+        bool volatility = false;
+        bool liquidity = false;
+        bool gap = false;  // forced deactivate on a data gap, not a filter failure
+
+        Price last_close = 0;
+        Price ema50 = 0;
+        int32_t natr_bp = 0;
+        Volume turnover_recent = 0;
+        Volume turnover_prev = 0;
+
+        int64_t surge_numerator = 0;
+        int64_t surge_denominator = 0;
+        int32_t min_natr_bp = 0;
+        Volume min_turnover = 0;
+    };
+
     void NotifyStarted(const StartupReport& report, const std::unordered_set<Symbol>& active);
-    void NotifyActivated(const Symbol& symbol, const std::unordered_set<Symbol>& active);
-    void NotifyDeactivated(const Symbol& symbol, const std::unordered_set<Symbol>& active);
+    void NotifyActivated(const Symbol& symbol, const TransitionDetail& detail,
+                         const std::unordered_set<Symbol>& active);
+    void NotifyDeactivated(const Symbol& symbol, const TransitionDetail& detail,
+                           const std::unordered_set<Symbol>& active);
 
     // Sends arbitrary text through the same queue and pacing. The manual
     // smoke test uses it; nothing on the candle path does.

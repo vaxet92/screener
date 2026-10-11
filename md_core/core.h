@@ -63,6 +63,14 @@ class CoreManager {
 
     uint32_t EmaPeriod() const noexcept { return ema_period_; }
 
+    // Thresholds, exposed read-only for the notifier's "(needs >X%)" text.
+    // They never change per symbol, so a Transition does not need to carry
+    // its own copy - the caller reads these once per message instead.
+    int64_t SurgeNumerator() const noexcept { return surge_numerator_; }
+    int64_t SurgeDenominator() const noexcept { return surge_denominator_; }
+    int32_t MinNatrBp() const noexcept { return min_natr_bp_; }
+    Volume MinTurnover() const noexcept { return min_turnover_; }
+
     // Builds the symbol universe. Called once at startup, before any candle.
     // The returned ids are indices into the state vector, and a Candle
     // carries one - so dispatch on the message path is an array index, with
@@ -119,6 +127,24 @@ class CoreManager {
     struct Transition {
         uint32_t symbol_id;
         bool active;
+
+        // Snapshot taken AT THE EDGE, not re-read later: by the time
+        // ControlManager::DrainRebuilds runs, SymbolTracker state may already
+        // reflect a LATER edge (or a rebuild), so the values a message needs
+        // to explain THIS transition have to travel with it.
+        Conditions conditions;
+
+        // True only for the forced-deactivate path inside RequestRebuild: a
+        // gap, not a filter failure, so `conditions` carries no real verdict
+        // (everything defaults false) and the notifier must say "gap", not
+        // list four broken conditions.
+        bool gap = false;
+
+        Price last_close = 0;
+        Price ema50 = 0;
+        int32_t natr_bp = 0;
+        Volume turnover_recent = 0;
+        Volume turnover_prev = 0;
     };
 
     // Transitions since the last drain. Swap-out, same shape as
@@ -147,6 +173,12 @@ class CoreManager {
     // there is nothing left for this function to read from it.
     void TryActivate(SymbolTracker& s);
     void TryDeactivate(SymbolTracker& s, const Conditions& c);
+
+    // Builds the Transition snapshot shared by all three push sites
+    // (TryActivate, TryDeactivate, RequestRebuild's forced path) - one place
+    // that reads the raw indicator values, so the three sites cannot drift
+    // apart on which tracker each field comes from.
+    Transition SnapshotTransition(const SymbolTracker& s, bool active, const Conditions& c, bool gap) const;
 
     // Record the symbol for a later rebuild and return.
     //
