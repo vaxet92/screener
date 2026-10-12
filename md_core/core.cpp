@@ -21,7 +21,7 @@ void CoreManager::SetUniverse(const std::vector<Symbol>& symbols) {
 
     for (const Symbol& symbol : symbols) {
         const auto id = static_cast<uint32_t>(state_.size());
-        state_.emplace_back(id, symbol, static_cast<int>(ema_period_));
+        state_.emplace_back(id, symbol, static_cast<int>(slow_ema_period_), static_cast<int>(fast_ema_period_));
         id_by_symbol_.emplace(symbol, id);
     }
 }
@@ -176,7 +176,7 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
 
     // Readiness is per indicator and ANDed here. A symbol missing history is
     // `not ready` and can never be ACTIVE - never "probably fine".
-    c.ready = turnover.ready && ltf.AtrReady() && htf.EmaReady();
+    c.ready = turnover.ready && ltf.AtrReady() && htf.EmaReady() && htf.FastEmaReady();
     if (!c.ready) {
         return c;
     }
@@ -206,6 +206,10 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
     // (DESIGN.md §15).
     c.liquidity = turnover.recent >= min_turnover_;
 
+    // Fast/slow EMA crossover, both legs on the HTF tracker - stricter than
+    // `trend` above (close vs slow EMA), additive to it, not a replacement.
+    c.ema_cross = htf.GetFastEma() > htf.GetEma();
+
     return c;
 }
 
@@ -227,6 +231,7 @@ CoreManager::Transition CoreManager::SnapshotTransition(const SymbolTracker& s, 
     t.gap = gap;
     t.last_close = s.Fast().LastClose();
     t.ema50 = s.Htf().GetEma();
+    t.fast_ema50 = s.Htf().GetFastEma();
     t.natr_bp = s.Ltf().GetNatrBp();
     const auto turnover = s.Fast().Turnover();
     t.turnover_recent = turnover.recent;
@@ -244,10 +249,10 @@ void CoreManager::TryActivate(SymbolTracker& s) {
     // this when c.All() holds) - the explicit Conditions is just the
     // snapshot the notifier reads back, not a re-check.
     pending_transitions_.push_back(
-        SnapshotTransition(s, true, Conditions{true, true, true, true, true}, /*gap=*/false));
-    Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} natr={}bp turnover_recent={} prev={}", s.Name(),
-                s.Fast().LastClose(), s.Htf().GetEma(), s.Ltf().GetNatrBp(), s.Fast().Turnover().recent,
-                s.Fast().Turnover().prev);
+        SnapshotTransition(s, true, Conditions{true, true, true, true, true, true}, /*gap=*/false));
+    Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} fast_ema50={} natr={}bp turnover_recent={} prev={}",
+                s.Name(), s.Fast().LastClose(), s.Htf().GetEma(), s.Htf().GetFastEma(), s.Ltf().GetNatrBp(),
+                s.Fast().Turnover().recent, s.Fast().Turnover().prev);
 }
 
 void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
@@ -259,8 +264,8 @@ void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
     pending_transitions_.push_back(SnapshotTransition(s, false, c, /*gap=*/false));
     // Logged with WHICH condition failed. "INACTIVE" on its own is
     // undiagnosable after the fact, and these transitions are the product.
-    Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={} liq={}", s.Name(), c.ready, c.surge,
-                c.trend, c.volatility, c.liquidity);
+    Logger::Log(LogLevel::kInfo, "INACTIVE {} ready={} surge={} trend={} vol={} liq={} ema_cross={}", s.Name(), c.ready,
+                c.surge, c.trend, c.volatility, c.liquidity, c.ema_cross);
 }
 
 void CoreManager::RequestRebuild(SymbolTracker& s) {

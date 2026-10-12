@@ -41,27 +41,36 @@ class CoreManager {
         bool trend = false;       // last 1h close above the 4h EMA
         bool volatility = false;  // NATR above the floor
         bool liquidity = false;   // recent-window turnover above the floor
+        bool ema_cross = false;   // HTF fast EMA above HTF slow EMA
 
-        bool All() const noexcept { return ready && surge && trend && volatility && liquidity; }
+        bool All() const noexcept { return ready && surge && trend && volatility && liquidity && ema_cross; }
     };
 
     // Thresholds moved out of compile-time constants (DESIGN.md §15) so
     // config.json can set them. Integer comparisons only - see DESIGN.md §3.
     //
-    //   ema_period          - HTF EMA period (was Ema<kEmaPeriod>)
+    //   slow_ema_period     - HTF EMA period (was Ema<kEmaPeriod>, named
+    //                         ema_period before the crossover condition
+    //                         below needed a second period)
+    //   fast_ema_period     - HTF EMA period for the fast/slow crossover
+    //                         condition (fast_ema > slow_ema). Must stay
+    //                         below slow_ema_period - enforced in
+    //                         ScreenerConfig::Validate(), not here.
     //   surge_numerator/denominator - recent*denominator > prev*numerator
     //   min_natr_bp         - NATR floor, in basis points
     //   min_turnover        - liquidity floor, at kVolumeScale, on the same
     //                         recent-window sum the surge condition reads
-    explicit CoreManager(uint32_t ema_period, int64_t surge_numerator, int64_t surge_denominator, int32_t min_natr_bp,
-                         Volume min_turnover) noexcept
-        : ema_period_(ema_period),
+    explicit CoreManager(uint32_t slow_ema_period, uint32_t fast_ema_period, int64_t surge_numerator,
+                         int64_t surge_denominator, int32_t min_natr_bp, Volume min_turnover) noexcept
+        : slow_ema_period_(slow_ema_period),
+          fast_ema_period_(fast_ema_period),
           surge_numerator_(surge_numerator),
           surge_denominator_(surge_denominator),
           min_natr_bp_(min_natr_bp),
           min_turnover_(min_turnover) {}
 
-    uint32_t EmaPeriod() const noexcept { return ema_period_; }
+    uint32_t EmaPeriod() const noexcept { return slow_ema_period_; }
+    uint32_t FastEmaPeriod() const noexcept { return fast_ema_period_; }
 
     // Thresholds, exposed read-only for the notifier's "(needs >X%)" text.
     // They never change per symbol, so a Transition does not need to carry
@@ -142,6 +151,7 @@ class CoreManager {
 
         Price last_close = 0;
         Price ema50 = 0;
+        Price fast_ema50 = 0;
         int32_t natr_bp = 0;
         Volume turnover_recent = 0;
         Volume turnover_prev = 0;
@@ -198,7 +208,8 @@ class CoreManager {
     // RequestRebuild's full, forced-INACTIVE treatment.
     void RequestFastRebuild(SymbolTracker& s);
 
-    const uint32_t ema_period_;
+    const uint32_t slow_ema_period_;
+    const uint32_t fast_ema_period_;
     const int64_t surge_numerator_;
     const int64_t surge_denominator_;
     const int32_t min_natr_bp_;

@@ -212,12 +212,18 @@ std::string ApplyConfigJson(std::string_view content, ScreenerConfig& config) {
 
         const std::string where = config.config_file + ": \"" + std::string(key) + "\": ";
 
-        if (key == "ema_period") {
+        if (key == "slow_ema_period") {
             uint64_t v = 0;
             if (field.value().get_uint64().get(v) || v <= 1 || v > 1'000'000) {
                 return where + "expected an integer > 1";
             }
-            config.ema_period = static_cast<uint32_t>(v);
+            config.slow_ema_period = static_cast<uint32_t>(v);
+        } else if (key == "fast_ema_period") {
+            uint64_t v = 0;
+            if (field.value().get_uint64().get(v) || v <= 1 || v > 1'000'000) {
+                return where + "expected an integer > 1";
+            }
+            config.fast_ema_period = static_cast<uint32_t>(v);
         } else if (key == "surge_numerator") {
             int64_t v = 0;
             if (field.value().get_int64().get(v) || v <= 0) {
@@ -388,6 +394,9 @@ std::string ScreenerConfig::Validate() const {
     }
     if (surge_numerator <= surge_denominator) {
         return "surge_numerator must be > surge_denominator (a surge ratio <= 1 would always pass)";
+    }
+    if (fast_ema_period >= slow_ema_period) {
+        return "fast_ema_period must be < slow_ema_period (the crossover condition could never fire otherwise)";
     }
     if (min_turnover < 0) {
         return "min_turnover_usdt must be >= 0";

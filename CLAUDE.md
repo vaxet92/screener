@@ -23,20 +23,12 @@ mechanism and trade-off in a debrief.
 
 Every component is tagged in `screener_prompt.md` §4. The tag decides who writes it.
 
-### [DRILL] — Anton writes it, cold. Claude must NOT write the implementation.
-
 For a DRILL component, Claude:
 
 1. gives the spec + interface + acceptance tests — **only when asked**;
 2. states the time budget;
 3. reviews Anton's code like a strict HFT interviewer: correctness, memory ordering, UB,
    layout, performance, naming;
-4. asks 2–3 follow-up questions an interviewer would ask;
-5. shows a reference implementation **only** after Anton's second attempt, or when he
-   explicitly says "show solution" — then diffs it against his.
-
-Writing a DRILL component unasked destroys the exercise. If a DRILL component is
-blocking something else, say so and wait — do not fill it in.
 
 DRILL components, split by phase (`DESIGN.md` §13):
 

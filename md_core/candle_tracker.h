@@ -55,11 +55,15 @@ class CandleTracker {
     // H1: volatility only now. The turnover window that used to live here
     // moved to FastTurnoverTracker, on the 5m stream (DESIGN.md §16) - surge
     // and liquidity no longer read this tracker at all.
-    static CandleTrackerPtr MakeLtf() { return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kAtr, 0)); }
-    // `ema_period` is runtime now (config.json), not the kEmaPeriod constant -
-    // only meaningful here, since MakeLtf's timeframe never uses Ema.
-    static CandleTrackerPtr MakeHtf(int ema_period) {  // H4: trend
-        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH4, Use::kEma, ema_period));
+    static CandleTrackerPtr MakeLtf() { return CandleTrackerPtr(new CandleTracker(TimeFrame::kH1, Use::kAtr, 0, 0)); }
+    // `slow_period`/`fast_period` are runtime now (config.json), not the
+    // kEmaPeriod constant - only meaningful here, since MakeLtf's timeframe
+    // never uses Ema. `fast_period` feeds the fast/slow EMA crossover
+    // condition (CoreManager::EvaluateConditions) - must stay below
+    // `slow_period`, enforced in ScreenerConfig::Validate(), not here: a
+    // CandleTracker has no config to validate against.
+    static CandleTrackerPtr MakeHtf(int slow_period, int fast_period) {  // H4: trend
+        return CandleTrackerPtr(new CandleTracker(TimeFrame::kH4, Use::kEma, slow_period, fast_period));
     }
 
     // Copy deleted, move defaulted.
@@ -91,6 +95,9 @@ class CandleTracker {
         if (ema_) {
             ema_->Update(c.close);
         }
+        if (fast_ema_) {
+            fast_ema_->Update(c.close);
+        }
     }
 
     // A gap cannot be patched into a recursive indicator, so recovery is a
@@ -102,6 +109,9 @@ class CandleTracker {
         }
         if (ema_) {
             ema_->Reset();
+        }
+        if (fast_ema_) {
+            fast_ema_->Reset();
         }
         recent_.clear();
         last_close_ = 0;
@@ -131,6 +141,13 @@ class CandleTracker {
     bool EmaReady() const noexcept { return ema_ && ema_->Ready(); }
     Price GetEma() const noexcept { return ema_->Value(); }
 
+    // Fast/slow crossover condition's fast leg. Same has_value()/Ready() split
+    // as the slow EMA above, and for the same reason: HasFastEma() is "does
+    // this timeframe use it", FastEmaReady() is "has it seen enough bars".
+    bool HasFastEma() const noexcept { return fast_ema_.has_value(); }
+    bool FastEmaReady() const noexcept { return fast_ema_ && fast_ema_->Ready(); }
+    Price GetFastEma() const noexcept { return fast_ema_->Value(); }
+
     bool HasAtr() const noexcept { return atr_.has_value(); }
     bool AtrReady() const noexcept { return atr_ && atr_->Ready(); }
     int32_t GetNatrBp() const noexcept { return atr_->NatrBp(last_close_); }
@@ -141,14 +158,19 @@ class CandleTracker {
         kAtr = 2,
     };
 
-    // `ema_period` is unused unless `use & kEma` - MakeLtf passes 0 for it.
-    explicit CandleTracker(TimeFrame frame, uint8_t use, int ema_period) : frame_(frame) {
-        if (use & kEma) ema_.emplace(ema_period);
+    // `slow_period`/`fast_period` are unused unless `use & kEma` - MakeLtf
+    // passes 0 for both.
+    explicit CandleTracker(TimeFrame frame, uint8_t use, int slow_period, int fast_period) : frame_(frame) {
+        if (use & kEma) {
+            ema_.emplace(slow_period);
+            fast_ema_.emplace(fast_period);
+        }
         if (use & kAtr) atr_.emplace();
     }
 
     TimeFrame frame_;
     std::optional<Ema> ema_;
+    std::optional<Ema> fast_ema_;
     std::optional<WilderAtr<kAtrPeriod>> atr_;
 
     std::deque<Candle> recent_;

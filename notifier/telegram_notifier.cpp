@@ -154,9 +154,10 @@ std::string FormatConditionBlock(const TelegramNotifier::TransitionDetail& d) {
         "\xF0\x9F\x93\x8A Trend: {} {} EMA50\n"
         "\xF0\x9F\x93\x88 Volume surge: {}\n"
         "\xF0\x9F\x8C\x8A Volatility: NATR {}\n"
-        "\xF0\x9F\x92\xA7 Liquidity: {}\n",
+        "\xF0\x9F\x92\xA7 Liquidity: {}\n"
+        "\xF0\x9F\x94\x80 EMA cross: fast {} slow\n",
         FormatPercentBp(trend_bp), trend_bp >= 0 ? "above" : "below", FormatSignedPercent(surge_pct),
-        FormatPercentBp(d.natr_bp), FormatUsd(d.turnover_recent / kVolumeScale));
+        FormatPercentBp(d.natr_bp), FormatUsd(d.turnover_recent / kVolumeScale), d.ema_cross ? "above" : "below");
 }
 
 // Deactivate-only: WHICH condition(s) broke, against which threshold. A gap
@@ -187,6 +188,9 @@ std::string FormatReason(const TelegramNotifier::TransitionDetail& d) {
     if (!d.liquidity) {
         failed.push_back(fmt::format("Liquidity {} (needs \xE2\x89\xA5{})", FormatUsd(d.turnover_recent / kVolumeScale),
                                      FormatUsd(d.min_turnover / kVolumeScale)));
+    }
+    if (!d.ema_cross) {
+        failed.push_back("EMA cross: fast EMA below slow EMA (needs above)");
     }
     if (failed.empty()) {
         return "";  // All() true would mean TryDeactivate was never called
