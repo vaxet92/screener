@@ -9,6 +9,6 @@
   "surge_denominator": 100,
   "// min_natr_bp": "Volatility floor, in basis points. NATR = Wilder ATR(14) / close, must exceed this. 100 = 1.00%.",
   "min_natr_bp": 100,
-  "// min_turnover_usdt": "Liquidity floor: the same 24-bar recent-turnover sum the surge condition reads must be at least this many USDT. MUST be a decimal STRING, not a JSON number - parsed straight to a scaled integer, never via a double. \"0.00\" (the default) means off: any positive turnover satisfies it.",
-  "min_turnover_usdt": "0.00"
+  "// min_median_turnover_usdt": "Liquidity floor: the median of the last 24 CLOSED HOURLY turnovers must be at least this many USDT. Ignores one spike hour, unlike a flat sum would. MUST be a decimal STRING, not a JSON number - parsed straight to a scaled integer, never via a double. \"0.00\" (the default) means off: any median satisfies it. The fast tracker's recent-window SUM has no threshold at all any more - it is still shown next to the median in the Telegram message, for context only.",
+  "min_median_turnover_usdt": "0.00"
 }

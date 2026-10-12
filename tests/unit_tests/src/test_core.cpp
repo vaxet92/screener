@@ -80,7 +80,8 @@ std::vector<Candle> FastHistory(uint32_t symbol_id, double close, double recent_
 // a threshold.
 CoreManager MakeCore() {
     return CoreManager(/*slow_ema_period=*/50, /*fast_ema_period=*/20, /*surge_numerator=*/130,
-                       /*surge_denominator=*/100, /*min_natr_bp=*/100, /*min_turnover=*/0);
+                       /*surge_denominator=*/100, /*min_natr_bp=*/100,
+                       /*min_median_turnover=*/0);
 }
 
 }  // namespace
@@ -461,7 +462,8 @@ TEST(CoreManager, EmaCrossFailureKeepsTheSymbolOutOfActiveEvenWhenTrendHolds) {
 // actually ANDed into `ready`, not just present on the struct.
 TEST(CoreManager, FastEmaNotReadyKeepsTheSymbolNotReady) {
     CoreManager core(/*slow_ema_period=*/10, /*fast_ema_period=*/50, /*surge_numerator=*/130,
-                     /*surge_denominator=*/100, /*min_natr_bp=*/100, /*min_turnover=*/0);
+                     /*surge_denominator=*/100, /*min_natr_bp=*/100,
+                     /*min_median_turnover=*/0);
     core.SetUniverse({"BTCUSDT"});
 
     // 80 LTF bars = 20 HTF bars: enough for the slow EMA(10) but far short of
@@ -547,10 +549,11 @@ TEST(CoreManager, LowVolatilityFailsTheNatrCondition) {
     EXPECT_FALSE(core.TrackerAt(0).IsActive());
 }
 
-// min_turnover = 0 (MakeCore's default) must behave exactly like the
+// min_median_turnover = 0 (MakeCore's default) must behave exactly like the
 // pre-config.json compile-time constants - this is the regression guard for
-// the new liquidity condition.
-TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
+// the liquidity condition (DESIGN.md §17: median of the last 24 hourly
+// turnovers, not the fast tracker's 24h sum).
+TEST(CoreManager, LiquidityMedianIsSatisfiedByDefault) {
     CoreManager core = MakeCore();
     core.SetUniverse({"BTCUSDT"});
 
@@ -560,16 +563,15 @@ TEST(CoreManager, LiquidityIsSatisfiedByDefault) {
     EXPECT_TRUE(core.EvaluateConditions(0).liquidity);
 }
 
-// A min_turnover above the fixture's recent-window sum must fail the
-// liquidity condition and keep the symbol out of ACTIVE even though
-// surge/trend/volatility all hold - same fixture as
-// ActivatesWhenAllThreeConditionsHold, only the threshold differs.
-//
-// recent-window sum = kFastSurgeWindowBars (288) * 100.0, at kVolumeScale.
-TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
+// A min_median_turnover above the fixture's constant hourly turnover must
+// fail the liquidity condition and keep the symbol out of ACTIVE even though
+// surge/trend/volatility all hold. History(0, 300, 100.0, 1.0) feeds a flat
+// V(1.0) turnover on every hourly bar, so once the 24-bar median window is
+// full its median is exactly V(1.0).
+TEST(CoreManager, MedianBelowTheFloorFailsTheLiquidityCondition) {
     CoreManager core(/*slow_ema_period=*/50, /*fast_ema_period=*/20, /*surge_numerator=*/130,
                      /*surge_denominator=*/100, /*min_natr_bp=*/100,
-                     /*min_turnover=*/V(100.0) * kFastSurgeWindowBars + 1);
+                     /*min_median_turnover=*/V(1.0) + 1);
     core.SetUniverse({"BTCUSDT"});
 
     core.Warmup(0, History(0, 300, 100.0, 1.0));
@@ -583,12 +585,45 @@ TEST(CoreManager, TurnoverBelowTheFloorFailsTheLiquidityCondition) {
     EXPECT_FALSE(core.TrackerAt(0).IsActive());
 }
 
+// Exactly at the floor must pass: the comparison is >=, not >.
+TEST(CoreManager, MedianAtTheFloorIsSatisfied) {
+    CoreManager core(/*slow_ema_period=*/50, /*fast_ema_period=*/20, /*surge_numerator=*/130,
+                     /*surge_denominator=*/100, /*min_natr_bp=*/100,
+                     /*min_median_turnover=*/V(1.0));
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, History(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
+
+    EXPECT_TRUE(core.EvaluateConditions(0).liquidity);
+}
+
+// The whole point of the median over the old sum: one spike hour must not
+// drag the median up. 23 hours at turnover 1.0, one at turnover 100000.0 -
+// the sum would be dominated by the spike, but the median (the 12th-smallest
+// of 24) stays at the flat value as long as fewer than half the window is
+// spiking.
+TEST(CoreManager, OneSpikeHourDoesNotMoveTheMedian) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history = History(0, 300, 100.0, 1.0);
+    // Spike the last applied hourly bar (still inside the most recent 24-bar
+    // window once warm-up finishes) without touching the other 23.
+    history.back().turnover = V(100000.0);
+    core.Warmup(0, history);
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
+
+    EXPECT_EQ(core.TrackerAt(0).Ltf().GetMedianTurnover(), V(1.0));
+}
+
 // slow_ema_period is a config.json field now (DESIGN.md §15), not the
 // compiled constant 50 - this proves warm-up and the trend condition both
 // honour a different period, not a hardcoded one.
 TEST(CoreManager, HonoursARuntimeEmaPeriodOtherThanFifty) {
     CoreManager core(/*slow_ema_period=*/10, /*fast_ema_period=*/5, /*surge_numerator=*/130,
-                     /*surge_denominator=*/100, /*min_natr_bp=*/100, /*min_turnover=*/0);
+                     /*surge_denominator=*/100, /*min_natr_bp=*/100,
+                     /*min_median_turnover=*/0);
     core.SetUniverse({"BTCUSDT"});
 
     // Period 10 on the HTF (4h) needs 10 * 4 = 40 LTF bars to produce a first

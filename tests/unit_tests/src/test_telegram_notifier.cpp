@@ -63,10 +63,11 @@ TelegramNotifier::TransitionDetail ActiveDetail() {
     d.natr_bp = 150;
     d.turnover_recent = 500'000 * kVolumeScale;
     d.turnover_prev = 300'000 * kVolumeScale;
+    d.turnover_median = 20'000 * kVolumeScale;
     d.surge_numerator = 130;
     d.surge_denominator = 100;
     d.min_natr_bp = 100;
-    d.min_turnover = 0;
+    d.min_median_turnover = 0;
     return d;
 }
 

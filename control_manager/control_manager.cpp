@@ -49,7 +49,7 @@ ControlManager::ControlManager(const ScreenerConfig& config)
       limiter_(ioc_, config.rest_max_requests_per_window, std::chrono::milliseconds(config.rest_window_ms)),
       notifier_(ioc_, ssl_ctx_, config),
       core_(config.slow_ema_period, config.fast_ema_period, config.surge_numerator, config.surge_denominator,
-            config.min_natr_bp, config.min_turnover) {
+            config.min_natr_bp, config.min_median_turnover) {
     load_root_certificates(ssl_ctx_);
     ssl_ctx_.set_verify_mode(boost::asio::ssl::verify_peer);
 }
@@ -396,10 +396,11 @@ void ControlManager::DrainRebuilds() {
         detail.natr_bp = t.natr_bp;
         detail.turnover_recent = t.turnover_recent;
         detail.turnover_prev = t.turnover_prev;
+        detail.turnover_median = t.turnover_median;
         detail.surge_numerator = core_.SurgeNumerator();
         detail.surge_denominator = core_.SurgeDenominator();
         detail.min_natr_bp = core_.MinNatrBp();
-        detail.min_turnover = core_.MinTurnover();
+        detail.min_median_turnover = core_.MedianFloor();
 
         if (t.active) {
             notifier_.NotifyActivated(core_.NameOf(t.symbol_id), detail, core_.ActiveInstruments());

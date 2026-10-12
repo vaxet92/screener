@@ -194,12 +194,15 @@ struct ScreenerConfig {
     // NATR floor, in basis points.
     int32_t min_natr_bp = 100;
 
-    // Liquidity floor: the recent-window turnover sum (same window the surge
-    // condition reads) must exceed this, scaled by kVolumeScale. Parsed from
-    // a decimal USDT string in config.json straight to a scaled integer -
-    // never via a double, same rule as every other price/volume value in
-    // this system.
-    Volume min_turnover = 0;
+    // Liquidity floor: the median of the last 24 CLOSED HOURLY turnovers
+    // (LTF tracker) must reach this, scaled by kVolumeScale (DESIGN.md §17).
+    // Parsed from a decimal USDT string in config.json straight to a scaled
+    // integer - never via a double, same rule as every other price/volume
+    // value in this system. There is no separate threshold on the fast
+    // tracker's recent-window SUM any more - it is shown next to the median
+    // in the Telegram message for context, but nothing compares it to a
+    // floor.
+    Volume min_median_turnover = 0;
 
     // Where the threshold group above is read from. A missing default file
     // means "use the compiled defaults"; a missing file named explicitly

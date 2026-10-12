@@ -40,7 +40,7 @@ class CoreManager {
         bool surge = false;       // recent turnover >> previous turnover
         bool trend = false;       // last 1h close above the 4h EMA
         bool volatility = false;  // NATR above the floor
-        bool liquidity = false;   // recent-window turnover above the floor
+        bool liquidity = false;   // median of the last 24 hourly turnovers above the floor (DESIGN.md §17)
         bool ema_cross = false;   // HTF fast EMA above HTF slow EMA
 
         bool All() const noexcept { return ready && surge && trend && volatility && liquidity && ema_cross; }
@@ -58,16 +58,21 @@ class CoreManager {
     //                         ScreenerConfig::Validate(), not here.
     //   surge_numerator/denominator - recent*denominator > prev*numerator
     //   min_natr_bp         - NATR floor, in basis points
-    //   min_turnover        - liquidity floor, at kVolumeScale, on the same
-    //                         recent-window sum the surge condition reads
+    //   min_median_turnover - liquidity floor, at kVolumeScale: the median of
+    //                         the last 24 closed hourly turnovers (LTF
+    //                         tracker) must reach this (DESIGN.md §17). The
+    //                         fast tracker's recent-window SUM has no
+    //                         threshold at all any more - it is still shown
+    //                         in the Telegram message next to the median, for
+    //                         context, but gates nothing.
     explicit CoreManager(uint32_t slow_ema_period, uint32_t fast_ema_period, int64_t surge_numerator,
-                         int64_t surge_denominator, int32_t min_natr_bp, Volume min_turnover) noexcept
+                         int64_t surge_denominator, int32_t min_natr_bp, Volume min_median_turnover) noexcept
         : slow_ema_period_(slow_ema_period),
           fast_ema_period_(fast_ema_period),
           surge_numerator_(surge_numerator),
           surge_denominator_(surge_denominator),
           min_natr_bp_(min_natr_bp),
-          min_turnover_(min_turnover) {}
+          median_floor_(min_median_turnover) {}
 
     uint32_t EmaPeriod() const noexcept { return slow_ema_period_; }
     uint32_t FastEmaPeriod() const noexcept { return fast_ema_period_; }
@@ -78,7 +83,7 @@ class CoreManager {
     int64_t SurgeNumerator() const noexcept { return surge_numerator_; }
     int64_t SurgeDenominator() const noexcept { return surge_denominator_; }
     int32_t MinNatrBp() const noexcept { return min_natr_bp_; }
-    Volume MinTurnover() const noexcept { return min_turnover_; }
+    Volume MedianFloor() const noexcept { return median_floor_; }
 
     // Builds the symbol universe. Called once at startup, before any candle.
     // The returned ids are indices into the state vector, and a Candle
@@ -155,6 +160,7 @@ class CoreManager {
         int32_t natr_bp = 0;
         Volume turnover_recent = 0;
         Volume turnover_prev = 0;
+        Volume turnover_median = 0;  // ltf.GetMedianTurnover() - what `liquidity` actually gates on
     };
 
     // Transitions since the last drain. Swap-out, same shape as
@@ -213,7 +219,7 @@ class CoreManager {
     const int64_t surge_numerator_;
     const int64_t surge_denominator_;
     const int32_t min_natr_bp_;
-    const Volume min_turnover_;
+    const Volume median_floor_;
 
     std::vector<SymbolTracker> state_;
 

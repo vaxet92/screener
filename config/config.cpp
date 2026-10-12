@@ -242,7 +242,7 @@ std::string ApplyConfigJson(std::string_view content, ScreenerConfig& config) {
                 return where + "expected an integer >= 0";
             }
             config.min_natr_bp = static_cast<int32_t>(v);
-        } else if (key == "min_turnover_usdt") {
+        } else if (key == "min_median_turnover_usdt") {
             // A STRING, not a JSON number - a fractional USDT amount parsed
             // through a double intermediate would reintroduce exactly the
             // rounding error the scaled-integer representation exists to
@@ -251,7 +251,7 @@ std::string ApplyConfigJson(std::string_view content, ScreenerConfig& config) {
             if (field.value().get_string().get(v) || v.empty()) {
                 return where + "expected a decimal string, e.g. \"1000000.00\"";
             }
-            config.min_turnover = static_cast<Volume>(ParseScaledDecimal<6>(v));
+            config.min_median_turnover = static_cast<Volume>(ParseScaledDecimal<6>(v));
         } else {
             // Unlike .env, nothing else shares this file - an unrecognised
             // key is a typo the operator should hear about, not a silently
@@ -398,8 +398,8 @@ std::string ScreenerConfig::Validate() const {
     if (fast_ema_period >= slow_ema_period) {
         return "fast_ema_period must be < slow_ema_period (the crossover condition could never fire otherwise)";
     }
-    if (min_turnover < 0) {
-        return "min_turnover_usdt must be >= 0";
+    if (min_median_turnover < 0) {
+        return "min_median_turnover_usdt must be >= 0";
     }
     if (telegram_enabled) {
         // Refuse to start rather than run with notifications silently off.

@@ -5,6 +5,7 @@
 
 #include "md_core/indicators/ema.h"
 #include "md_core/indicators/int_math.h"
+#include "md_core/indicators/turnover_median_window.h"
 #include "md_core/indicators/turnover_window.h"
 #include "md_core/indicators/wilder_atr.h"
 
@@ -324,4 +325,70 @@ TEST(TurnoverWindow, ResetClearsBothSums) {
     EXPECT_FALSE(v.ready);
     EXPECT_EQ(v.recent, 0);
     EXPECT_EQ(v.prev, 0);
+}
+
+// ---------------------------------------------------------------------------
+// TurnoverMedianWindow (DESIGN.md §17)
+// ---------------------------------------------------------------------------
+
+TEST(TurnoverMedianWindow, NotReadyUntilFull) {
+    TurnoverMedianWindow w;
+    for (int i = 0; i < 23; ++i) {
+        w.Update(V(1.0));
+        EXPECT_FALSE(w.Ready()) << "ready after " << (i + 1) << " bars";
+    }
+    w.Update(V(1.0));
+    EXPECT_TRUE(w.Ready());
+}
+
+// The median is the LOWER-middle of 24 sorted values (index 11, the
+// 12th-smallest), not an average of the two center ones - a deliberate
+// simplification since this is a one-shot threshold check, not a recursive
+// indicator with error to round against. Feed a known-shuffled set and pin
+// down which value that is.
+TEST(TurnoverMedianWindow, MedianIsTheLowerMiddleOfSortedValues) {
+    TurnoverMedianWindow w;
+    // 0..23 shuffled; sorted this is exactly {0, 1, ..., 23}, so the
+    // 12th-smallest (index 11) is 11.
+    const int order[24] = {17, 3, 22, 0, 9, 14, 1, 20, 6, 11, 23, 8, 2, 19, 5, 16, 10, 21, 4, 13, 7, 18, 12, 15};
+    for (int v : order) {
+        w.Update(V(static_cast<double>(v)));
+    }
+    ASSERT_TRUE(w.Ready());
+    EXPECT_EQ(w.Median(), V(11.0));
+}
+
+TEST(TurnoverMedianWindow, SlidesAndDropsTheOldestBar) {
+    TurnoverMedianWindow w;
+    for (int i = 1; i <= 24; ++i) {
+        w.Update(V(static_cast<double>(i)));  // {1..24}, median (index 11) = 12
+    }
+    ASSERT_TRUE(w.Ready());
+    EXPECT_EQ(w.Median(), V(12.0));
+
+    // Push a 25th bar: the 1 falls out, window becomes {2..25}, median = 13.
+    w.Update(V(25.0));
+    EXPECT_EQ(w.Median(), V(13.0));
+}
+
+// The whole point of a median over a sum: one spike bar in an otherwise flat
+// window must not move it, as long as it stays in the upper half once sorted.
+TEST(TurnoverMedianWindow, OneSpikeBarDoesNotMoveTheMedian) {
+    TurnoverMedianWindow w;
+    for (int i = 0; i < 23; ++i) {
+        w.Update(V(1.0));
+    }
+    w.Update(V(1'000'000.0));  // the 24th bar, a massive spike
+    ASSERT_TRUE(w.Ready());
+    EXPECT_EQ(w.Median(), V(1.0));
+}
+
+TEST(TurnoverMedianWindow, ResetClearsTheMedian) {
+    TurnoverMedianWindow w;
+    for (int i = 0; i < 24; ++i) {
+        w.Update(V(1.0));
+    }
+    ASSERT_TRUE(w.Ready());
+    w.Reset();
+    EXPECT_FALSE(w.Ready());
 }

@@ -176,7 +176,7 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
 
     // Readiness is per indicator and ANDed here. A symbol missing history is
     // `not ready` and can never be ACTIVE - never "probably fine".
-    c.ready = turnover.ready && ltf.AtrReady() && htf.EmaReady() && htf.FastEmaReady();
+    c.ready = turnover.ready && ltf.AtrReady() && ltf.MedianTurnoverReady() && htf.EmaReady() && htf.FastEmaReady();
     if (!c.ready) {
         return c;
     }
@@ -201,10 +201,12 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
 
     c.volatility = ltf.GetNatrBp() > min_natr_bp_;
 
-    // Same recent-window sum the surge condition reads. >= so the default
-    // min_turnover_ = 0 is always satisfied - off until configured
-    // (DESIGN.md §15).
-    c.liquidity = turnover.recent >= min_turnover_;
+    // Median of the last 24 closed hourly turnovers (LTF tracker), NOT the
+    // fast tracker's 24h sum - a single spike hour inflates the sum while
+    // leaving the symbol dead the rest of the day (DESIGN.md §17). >= so the
+    // default min_median_turnover = 0 is always satisfied - off until
+    // configured, same policy min_turnover had.
+    c.liquidity = ltf.GetMedianTurnover() >= median_floor_;
 
     // Fast/slow EMA crossover, both legs on the HTF tracker - stricter than
     // `trend` above (close vs slow EMA), additive to it, not a replacement.
@@ -236,6 +238,9 @@ CoreManager::Transition CoreManager::SnapshotTransition(const SymbolTracker& s, 
     const auto turnover = s.Fast().Turnover();
     t.turnover_recent = turnover.recent;
     t.turnover_prev = turnover.prev;
+    // UB to call GetMedianTurnover() before Ready() - a symbol that just
+    // failed `ready` can reach here with less than 24 hourly bars.
+    t.turnover_median = s.Ltf().MedianTurnoverReady() ? s.Ltf().GetMedianTurnover() : 0;
     return t;
 }
 
@@ -250,9 +255,10 @@ void CoreManager::TryActivate(SymbolTracker& s) {
     // snapshot the notifier reads back, not a re-check.
     pending_transitions_.push_back(
         SnapshotTransition(s, true, Conditions{true, true, true, true, true, true}, /*gap=*/false));
-    Logger::Log(LogLevel::kInfo, "ACTIVE   {} close={} ema50={} fast_ema50={} natr={}bp turnover_recent={} prev={}",
-                s.Name(), s.Fast().LastClose(), s.Htf().GetEma(), s.Htf().GetFastEma(), s.Ltf().GetNatrBp(),
-                s.Fast().Turnover().recent, s.Fast().Turnover().prev);
+    Logger::Log(LogLevel::kInfo,
+                "ACTIVE   {} close={} ema50={} fast_ema50={} natr={}bp turnover_recent={} prev={} median={}", s.Name(),
+                s.Fast().LastClose(), s.Htf().GetEma(), s.Htf().GetFastEma(), s.Ltf().GetNatrBp(),
+                s.Fast().Turnover().recent, s.Fast().Turnover().prev, s.Ltf().GetMedianTurnover());
 }
 
 void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
