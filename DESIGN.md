@@ -1556,3 +1556,50 @@ now unrecoverable" gap — it depends on what the indicator downstream of it act
    expected — needs the same kind of live measurement §12 item 3 already ran once.
 4. Whether `min_turnover` behaviour (§15) should also gain its own fail-closed note during
    `fast_rebuild_pending_`, since it reads the same window as surge.
+
+---
+
+## 17. Liquidity: median of the last 24 hourly turnovers — supersedes §15's sum
+
+§15 added `liquidity` as `turnover.recent >= min_turnover` — a flat SUM over a 24h window.
+That sum is fooled by one spike hour: a single huge hour can carry the whole day's sum past
+the floor while the symbol is otherwise dead the other 23 hours. A median ignores that one
+outlier, so it answers "is this symbol liquid most of the time" instead of "did it move a lot
+at some point today."
+
+**What changed:**
+
+- A new indicator, `TurnoverMedianWindow` (`md_core/indicators/turnover_median_window.h`): a
+  24-slot ring of CLOSED HOURLY turnovers, median cached on `Update()` (not recomputed on
+  `Get()` — `EvaluateConditions` is called on every closed bar on EITHER stream, 5m included,
+  so a per-read sort would run far more often than once an hour). "Median" here is the
+  lower-middle of 24 sorted values (index 11, the 12th-smallest), not an average of the two
+  center ones — a deliberate simplification: this is a one-shot threshold check, not a
+  recursive indicator, so there is no compounding error for an averaging rounding rule to
+  protect against.
+- It lives on the LTF (1h) `CandleTracker`, not the 5m `FastTurnoverTracker` — a third
+  optional indicator (`Use::kMedianTurnover`), same has_value()/Ready() split as ATR/EMA. It
+  rides the existing H1 warm-up/gap-rebuild path (`Reset()` + replay) for free; no new
+  rebuild logic.
+- `CoreManager::Conditions::liquidity` now reads `ltf.GetMedianTurnover() >= median_floor_`
+  instead of `fast.Turnover().recent >= min_turnover_`. `c.ready` gains
+  `ltf.MedianTurnoverReady()`.
+- `min_turnover` (config: `min_turnover_usdt`) is **removed entirely** — there is no
+  threshold on the fast tracker's sum any more, and nothing in `ScreenerConfig`,
+  `CoreManager`, or `TelegramNotifier::TransitionDetail` carries it. The new, independent
+  config field `min_median_turnover` (`min_median_turnover_usdt`) is the only liquidity
+  threshold, and it is what `liquidity` gates on. The fast tracker's recent-window sum
+  (`turnover_recent`) is still read and still shown in the Telegram message next to the
+  median - for context only, so the median floor can be picked from observation - but
+  nothing compares it to a floor.
+- `config.json`'s live `min_median_turnover_usdt` is left at `"0"` (off) pending real data —
+  the Telegram message now prints both the current sum and the median side by side
+  specifically so the floor can be picked from observation rather than guessed.
+- The surge condition and trend's price leg are untouched: both still read
+  `FastTurnoverTracker` (`turnover.recent`/`turnover.prev`, `fast.LastClose()`). Only
+  `liquidity`'s source moved.
+
+**Tests:** `TurnoverMedianWindow` unit tests (readiness, which sorted index is "the median",
+sliding, the one-spike-bar case, reset) in `test_indicators.cpp`; `CoreManager` tests in
+`test_core.cpp` covering the default-off case, the boundary (`>=`), and the one-spike-hour
+case end to end through `EvaluateConditions`.

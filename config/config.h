@@ -3,7 +3,7 @@
 // ScreenerConfig: every tunable in one place, with defaults that work.
 //
 // An optional config FILE (config.json) now exists for the filter
-// thresholds: ema_period, the surge ratio and the NATR/turnover floors are
+// thresholds: slow_ema_period/fast_ema_period, the surge ratio and the NATR/turnover floors are
 // no longer compile-time constants, so there is something an operator can
 // legitimately choose before a run. Everything else stays a flag - see
 // DESIGN.md for why only the threshold group moved.
@@ -175,7 +175,15 @@ struct ScreenerConfig {
     // (Ema<kEmaPeriod>); now a runtime field the indicator is constructed
     // with. warmup_ltf_bars is NOT auto-derived from this in the file reader
     // - see Validate() for why that would be the wrong place to do it.
-    uint32_t ema_period = 50;
+    //
+    // Was named `ema_period` before the fast/slow EMA crossover condition
+    // existed; renamed once a second EMA period needed a name too.
+    uint32_t slow_ema_period = 50;
+
+    // HTF (4h) EMA period for the fast/slow crossover condition: a symbol
+    // is only ACTIVE while fast_ema > slow_ema. Must stay below
+    // slow_ema_period - see Validate().
+    uint32_t fast_ema_period = 20;
 
     // Volume surge: recent_turnover * surge_denominator > prev_turnover *
     // surge_numerator. Same integer cross-multiplication CoreManager always
@@ -186,12 +194,15 @@ struct ScreenerConfig {
     // NATR floor, in basis points.
     int32_t min_natr_bp = 100;
 
-    // Liquidity floor: the recent-window turnover sum (same window the surge
-    // condition reads) must exceed this, scaled by kVolumeScale. Parsed from
-    // a decimal USDT string in config.json straight to a scaled integer -
-    // never via a double, same rule as every other price/volume value in
-    // this system.
-    Volume min_turnover = 0;
+    // Liquidity floor: the median of the last 24 CLOSED HOURLY turnovers
+    // (LTF tracker) must reach this, scaled by kVolumeScale (DESIGN.md §17).
+    // Parsed from a decimal USDT string in config.json straight to a scaled
+    // integer - never via a double, same rule as every other price/volume
+    // value in this system. There is no separate threshold on the fast
+    // tracker's recent-window SUM any more - it is shown next to the median
+    // in the Telegram message for context, but nothing compares it to a
+    // floor.
+    Volume min_median_turnover = 0;
 
     // Where the threshold group above is read from. A missing default file
     // means "use the compiled defaults"; a missing file named explicitly
@@ -228,7 +239,7 @@ struct ScreenerConfig {
 std::string ApplyDotEnv(std::string_view content, ScreenerConfig& config);
 
 // Applies config.json CONTENT (not a path) to `config`. Empty return on
-// success, otherwise the reason. Only the five threshold fields above are
+// success, otherwise the reason. Only the six threshold fields above are
 // recognised; any other key is an error, unlike .env - this file has no
 // other tool sharing it, so an unrecognised key is a typo the operator
 // should hear about, not a quietly ignored line.

@@ -84,18 +84,21 @@ class TelegramNotifier {
         bool trend = false;
         bool volatility = false;
         bool liquidity = false;
-        bool gap = false;  // forced deactivate on a data gap, not a filter failure
+        bool ema_cross = false;  // HTF fast EMA above HTF slow EMA
+        bool gap = false;        // forced deactivate on a data gap, not a filter failure
 
         Price last_close = 0;
         Price ema50 = 0;
+        Price fast_ema50 = 0;
         int32_t natr_bp = 0;
         Volume turnover_recent = 0;
         Volume turnover_prev = 0;
+        Volume turnover_median = 0;  // what `liquidity` actually gates on (DESIGN.md §17)
 
         int64_t surge_numerator = 0;
         int64_t surge_denominator = 0;
         int32_t min_natr_bp = 0;
-        Volume min_turnover = 0;
+        Volume min_median_turnover = 0;  // the liquidity floor (DESIGN.md §17)
     };
 
     void NotifyStarted(const StartupReport& report, const std::unordered_set<Symbol>& active);

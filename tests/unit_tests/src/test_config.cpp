@@ -263,27 +263,29 @@ TEST(DotEnvFile, SecretsWithoutTheFlagLeaveNotificationsOff) {
     EXPECT_FALSE(c->telegram_enabled);
 }
 
-TEST(ConfigJson, ReadsAllFiveThresholdFields) {
+TEST(ConfigJson, ReadsAllSixThresholdFields) {
     std::string error;
     const ScreenerConfig c = ParseJson(
-        R"({"ema_period": 20, "surge_numerator": 150, "surge_denominator": 100,
-            "min_natr_bp": 80, "min_turnover_usdt": "250000.50"})",
+        R"({"slow_ema_period": 20, "fast_ema_period": 10, "surge_numerator": 150, "surge_denominator": 100,
+            "min_natr_bp": 80, "min_median_turnover_usdt": "12500.25"})",
         error);
 
     EXPECT_TRUE(error.empty()) << error;
-    EXPECT_EQ(c.ema_period, 20u);
+    EXPECT_EQ(c.slow_ema_period, 20u);
+    EXPECT_EQ(c.fast_ema_period, 10u);
     EXPECT_EQ(c.surge_numerator, 150);
     EXPECT_EQ(c.surge_denominator, 100);
     EXPECT_EQ(c.min_natr_bp, 80);
-    EXPECT_EQ(c.min_turnover, 250000500000);  // 250000.50 * kVolumeScale (1e6)
+    EXPECT_EQ(c.min_median_turnover, 12500250000);  // 12500.25 * kVolumeScale (1e6)
 }
 
 TEST(ConfigJson, LeavesUnmentionedFieldsAtTheCompiledDefault) {
     std::string error;
-    const ScreenerConfig c = ParseJson(R"({"ema_period": 20})", error);
+    const ScreenerConfig c = ParseJson(R"({"slow_ema_period": 30})", error);
 
     EXPECT_TRUE(error.empty()) << error;
-    EXPECT_EQ(c.ema_period, 20u);
+    EXPECT_EQ(c.slow_ema_period, 30u);
+    EXPECT_EQ(c.fast_ema_period, 20u);    // unmentioned: compiled default
     EXPECT_EQ(c.surge_numerator, 130);    // unmentioned: compiled default
     EXPECT_EQ(c.surge_denominator, 100);  // unmentioned: compiled default
 }
@@ -294,10 +296,10 @@ TEST(ConfigJson, IgnoresASlashSlashPrefixedCommentKey) {
     // document a field without becoming unusable as a direct copy to
     // config.json.
     std::string error;
-    const ScreenerConfig c = ParseJson(R"({"// ema_period": "HTF EMA period", "ema_period": 20})", error);
+    const ScreenerConfig c = ParseJson(R"({"// slow_ema_period": "HTF EMA period", "slow_ema_period": 20})", error);
 
     EXPECT_TRUE(error.empty()) << error;
-    EXPECT_EQ(c.ema_period, 20u);
+    EXPECT_EQ(c.slow_ema_period, 20u);
 }
 
 TEST(ConfigJson, RejectsAnUnrecognisedKey) {
@@ -321,19 +323,35 @@ TEST(ConfigJson, RejectsATopLevelArray) {
     EXPECT_FALSE(error.empty());
 }
 
-TEST(ConfigJson, RejectsEmaPeriodOfOneOrLess) {
+TEST(ConfigJson, RejectsSlowEmaPeriodOfOneOrLess) {
     std::string error;
-    ParseJson(R"({"ema_period": 1})", error);
+    ParseJson(R"({"slow_ema_period": 1})", error);
     EXPECT_FALSE(error.empty());
 }
 
-TEST(ConfigJson, RejectsATurnoverFloorGivenAsANumberNotAString) {
-    // min_turnover_usdt must be a decimal STRING - a bare JSON number with a
-    // fractional part would have to go through a double to reach simdjson's
-    // get_uint64/get_double, reintroducing the rounding error the scaled
-    // integer exists to avoid.
+TEST(ConfigJson, RejectsFastEmaPeriodOfOneOrLess) {
     std::string error;
-    ParseJson(R"({"min_turnover_usdt": 250000.50})", error);
+    ParseJson(R"({"fast_ema_period": 1})", error);
+    EXPECT_FALSE(error.empty());
+}
+
+TEST(ConfigValidate, RejectsFastEmaPeriodNotBelowSlow) {
+    ScreenerConfig config;
+    config.fast_ema_period = 50;
+    config.slow_ema_period = 50;
+
+    const std::string error = config.Validate();
+    ASSERT_FALSE(error.empty());
+    EXPECT_NE(error.find("fast_ema_period"), std::string::npos) << error;
+}
+
+// min_median_turnover_usdt must be a decimal STRING - a bare JSON number
+// with a fractional part would have to go through a double to reach
+// simdjson's get_uint64/get_double, reintroducing the rounding error the
+// scaled integer exists to avoid (DESIGN.md §17).
+TEST(ConfigJson, RejectsAMedianTurnoverFloorGivenAsANumberNotAString) {
+    std::string error;
+    ParseJson(R"({"min_median_turnover_usdt": 12500.25})", error);
     EXPECT_FALSE(error.empty());
 }
 
@@ -345,7 +363,7 @@ TEST(ConfigJsonFile, AnExplicitPathThatCannotBeReadIsFatal) {
 }
 
 TEST(ConfigJsonFile, AnExplicitValidFileIsApplied) {
-    const std::string path = WriteTempConfigJson(R"({"ema_period": 30})");
+    const std::string path = WriteTempConfigJson(R"({"slow_ema_period": 30})");
 
     UnsetEnvVar("TELEGRAM_BOT_TOKEN");
     UnsetEnvVar("TELEGRAM_CHAT_ID");
@@ -354,7 +372,7 @@ TEST(ConfigJsonFile, AnExplicitValidFileIsApplied) {
     std::remove(path.c_str());
 
     ASSERT_TRUE(c.has_value());
-    EXPECT_EQ(c->ema_period, 30u);
+    EXPECT_EQ(c->slow_ema_period, 30u);
 }
 
 TEST(ConfigJsonFile, AMalformedExplicitFileIsFatal) {
