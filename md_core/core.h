@@ -116,13 +116,23 @@ class CoreManager {
     void WarmupFast(uint32_t symbol_id, std::span<const Candle> candles);
 
     // Apply one CLOSED 1h candle. The main entry point on the message path.
-    void ApplyCandle(const Candle& c);
+    //
+    // `now_ms` defaults to a real wall-clock read, taken once here per event
+    // and threaded down through Evaluate()/TryActivate()/TryDeactivate()
+    // rather than re-read per function - it is what the re-activation
+    // cooldown (DESIGN.md) is measured against. Tests pass it explicitly to
+    // control the cooldown boundary deterministically.
+    void ApplyCandle(const Candle& c, int64_t now_ms = NowMs());
 
     // Apply one CLOSED 5m candle (DESIGN.md §16). The second entry point on
     // the message path - routed here by whoever reads Candle::timeframe,
     // never by this class: CoreManager does not know which WS topic a bar
     // came from, only which stream it is being told to update.
-    void ApplyFastCandle(const Candle& c);
+    //
+    // Same `now_ms` contract as ApplyCandle() above - this stream can also
+    // trigger Evaluate(), so the cooldown gate must see whichever stream's
+    // event is currently running, not just the 1h one.
+    void ApplyFastCandle(const Candle& c, int64_t now_ms = NowMs());
 
     // Symbols that hit a gap and need a REST rebuild. Drained by the main
     // loop after each frame, never serviced inline - see RequestRebuild().
@@ -178,17 +188,27 @@ class CoreManager {
 
     const SymbolTracker& TrackerAt(uint32_t symbol_id) const { return state_[symbol_id]; }
 
+    // Real wall-clock read, ms since epoch. A free function (not a member)
+    // so it can serve as a default argument above - see ApplyCandle().
+    static int64_t NowMs() noexcept;
+
    private:
+    // Re-activation cooldown after a filter-failure deactivation (not a gap -
+    // see RequestRebuild). 1h, matching the LTF period: a symbol that just
+    // flipped INACTIVE on a boundary case must not immediately flip back on
+    // the next tick of noise.
+    static constexpr int64_t kCooldownMs = 3'600'000;
+
     // Hook for "a candle on this timeframe just closed". Fires once per
     // closed 1h bar, and additionally for the 4h bar that bar completes.
     void ApplyCandleComplete(SymbolTracker& s, TimeFrame frame);
 
-    void Evaluate(SymbolTracker& s);
+    void Evaluate(SymbolTracker& s, int64_t now_ms);
     // No Conditions parameter: every condition is true by construction at
     // every call site (Evaluate() only calls this when c.All() holds), so
     // there is nothing left for this function to read from it.
-    void TryActivate(SymbolTracker& s);
-    void TryDeactivate(SymbolTracker& s, const Conditions& c);
+    void TryActivate(SymbolTracker& s, int64_t now_ms);
+    void TryDeactivate(SymbolTracker& s, int64_t now_ms, const Conditions& c);
 
     // Builds the Transition snapshot shared by all three push sites
     // (TryActivate, TryDeactivate, RequestRebuild's forced path) - one place
@@ -206,13 +226,17 @@ class CoreManager {
     // push_back and removes the re-entrancy entirely.
     void RequestRebuild(SymbolTracker& s);
 
+    // ApplyFastCandle's now_ms, threaded through: RequestFastRebuild() calls
+    // Evaluate() itself (see its definition), and that call must see the
+    // same event timestamp ApplyFastCandle read, not a fresh clock read.
+
     // Lighter than RequestRebuild(): resets ONLY the fast turnover window
     // (fail closed - surge/liquidity/ready go false through the normal
     // Evaluate() path below, not through a forced bypass) and queues a
     // re-fetch. Never touches is_active_ directly and never touches the
     // 1h/4h trackers. See DESIGN.md §16 for why a 5m gap does not need
     // RequestRebuild's full, forced-INACTIVE treatment.
-    void RequestFastRebuild(SymbolTracker& s);
+    void RequestFastRebuild(SymbolTracker& s, int64_t now_ms);
 
     const uint32_t slow_ema_period_;
     const uint32_t fast_ema_period_;

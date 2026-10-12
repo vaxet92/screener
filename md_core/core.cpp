@@ -1,8 +1,15 @@
 #include "md_core/core.h"
 
+#include <chrono>
+
 #include "logger/logger.h"
 
 namespace screener {
+
+int64_t CoreManager::NowMs() noexcept {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
 
 void CoreManager::SetUniverse(const std::vector<Symbol>& symbols) {
     state_.clear();
@@ -52,8 +59,10 @@ void CoreManager::Warmup(uint32_t symbol_id, std::span<const Candle> candles) {
     // A rebuilt symbol is re-evaluated immediately rather than waiting for
     // its next live bar: it was forced INACTIVE when the gap was seen, and
     // without this it would stay INACTIVE for up to an hour after its state
-    // is already correct again.
-    Evaluate(s);
+    // is already correct again. A gap never set the cooldown (RequestRebuild
+    // bypasses TryDeactivate), so there is nothing here for NowMs() to be
+    // gated against.
+    Evaluate(s, NowMs());
 }
 
 void CoreManager::WarmupFast(uint32_t symbol_id, std::span<const Candle> candles) {
@@ -70,10 +79,10 @@ void CoreManager::WarmupFast(uint32_t symbol_id, std::span<const Candle> candles
     }
 
     s.SetFastRebuildPending(false);
-    Evaluate(s);
+    Evaluate(s, NowMs());
 }
 
-void CoreManager::ApplyCandle(const Candle& c) {
+void CoreManager::ApplyCandle(const Candle& c, int64_t now_ms) {
     if (c.symbol_id >= state_.size()) {
         Logger::Log(LogLevel::kError, "ApplyCandle: unknown symbol_id {}", c.symbol_id);
         return;
@@ -119,10 +128,10 @@ void CoreManager::ApplyCandle(const Candle& c) {
         ApplyCandleComplete(s, TimeFrame::kH4);
     }
 
-    Evaluate(s);
+    Evaluate(s, now_ms);
 }
 
-void CoreManager::ApplyFastCandle(const Candle& c) {
+void CoreManager::ApplyFastCandle(const Candle& c, int64_t now_ms) {
     if (c.symbol_id >= state_.size()) {
         Logger::Log(LogLevel::kError, "ApplyFastCandle: unknown symbol_id {}", c.symbol_id);
         return;
@@ -141,7 +150,7 @@ void CoreManager::ApplyFastCandle(const Candle& c) {
         case Arrival::kStale:
             return;
         case Arrival::kGap:
-            RequestFastRebuild(s);
+            RequestFastRebuild(s, now_ms);
             return;
         case Arrival::kFirst:
         case Arrival::kNext:
@@ -149,7 +158,7 @@ void CoreManager::ApplyFastCandle(const Candle& c) {
     }
 
     s.ApplyFast(c);
-    Evaluate(s);
+    Evaluate(s, now_ms);
 }
 
 void CoreManager::ApplyCandleComplete(SymbolTracker& s, TimeFrame frame) {
@@ -215,12 +224,12 @@ CoreManager::Conditions CoreManager::EvaluateConditions(uint32_t symbol_id) cons
     return c;
 }
 
-void CoreManager::Evaluate(SymbolTracker& s) {
+void CoreManager::Evaluate(SymbolTracker& s, int64_t now_ms) {
     const Conditions c = EvaluateConditions(s.Id());
     if (c.All()) {
-        TryActivate(s);
+        TryActivate(s, now_ms);
     } else {
-        TryDeactivate(s, c);
+        TryDeactivate(s, now_ms, c);
     }
 }
 
@@ -244,9 +253,14 @@ CoreManager::Transition CoreManager::SnapshotTransition(const SymbolTracker& s, 
     return t;
 }
 
-void CoreManager::TryActivate(SymbolTracker& s) {
+void CoreManager::TryActivate(SymbolTracker& s, int64_t now_ms) {
     if (s.IsActive()) {
         return;  // edge-triggered: already active, nothing to announce
+    }
+    // Cooldown gate: a filter-failure deactivation (TryDeactivate) sets this;
+    // a gap (RequestRebuild) never does. 0 means "never deactivated".
+    if (s.CooldownUntil() != 0 && now_ms < s.CooldownUntil()) {
+        return;
     }
     s.SetActive(true);
     active_instruments_.insert(s.Name());
@@ -261,11 +275,12 @@ void CoreManager::TryActivate(SymbolTracker& s) {
                 s.Fast().Turnover().recent, s.Fast().Turnover().prev, s.Ltf().GetMedianTurnover());
 }
 
-void CoreManager::TryDeactivate(SymbolTracker& s, const Conditions& c) {
+void CoreManager::TryDeactivate(SymbolTracker& s, int64_t now_ms, const Conditions& c) {
     if (!s.IsActive()) {
         return;
     }
     s.SetActive(false);
+    s.SetCooldownUntil(now_ms + kCooldownMs);
     active_instruments_.erase(s.Name());
     pending_transitions_.push_back(SnapshotTransition(s, false, c, /*gap=*/false));
     // Logged with WHICH condition failed. "INACTIVE" on its own is
@@ -298,7 +313,7 @@ void CoreManager::RequestRebuild(SymbolTracker& s) {
     Logger::Log(LogLevel::kWarning, "gap on {} after open_time={} - rebuild queued", s.Name(), s.LastLtfOpenTime());
 }
 
-void CoreManager::RequestFastRebuild(SymbolTracker& s) {
+void CoreManager::RequestFastRebuild(SymbolTracker& s, int64_t now_ms) {
     if (s.FastRebuildPending()) {
         return;
     }
@@ -313,9 +328,12 @@ void CoreManager::RequestFastRebuild(SymbolTracker& s) {
     // 1h/4h trackers are untouched, so if the symbol was ACTIVE only because
     // of them plus a now-invalid turnover window, the ordinary Evaluate()
     // call correctly deactivates it and records the transition itself.
+    //
+    // now_ms is ApplyFastCandle's event timestamp, not a fresh clock read -
+    // this call and that one must see the same "now".
     s.ResetFast();
     pending_fast_rebuilds_.push_back(s.Id());
-    Evaluate(s);
+    Evaluate(s, now_ms);
 
     Logger::Log(LogLevel::kWarning, "5m gap on {} after open_time={} - fast rebuild queued (1h/4h state untouched)",
                 s.Name(), s.LastFastOpenTime());

@@ -147,6 +147,15 @@ class SymbolTracker {
     bool RebuildPending() const noexcept { return rebuild_pending_; }
     void SetRebuildPending(bool pending) noexcept { rebuild_pending_ = pending; }
 
+    // Wall-clock ms before which TryActivate() must not re-activate this
+    // symbol, set by TryDeactivate() on a filter-failure deactivation. 0
+    // means "never deactivated / no cooldown owed" - a gap-forced
+    // deactivation (RequestRebuild) deliberately does NOT set this: a gap is
+    // "our data was wrong", not a filter failure, and must not delay recovery
+    // once the rebuild completes.
+    int64_t CooldownUntil() const noexcept { return cooldown_until_ms_; }
+    void SetCooldownUntil(int64_t until_ms) noexcept { cooldown_until_ms_ = until_ms; }
+
     // Same two jobs as RebuildPending/SetRebuildPending, for the independent
     // 5m stream's gap. Deliberately a SEPARATE flag: a 1h gap and a 5m gap
     // must be able to be in flight at the same time without one blocking the
@@ -209,6 +218,8 @@ class SymbolTracker {
 
     bool rebuild_pending_ = false;
     bool fast_rebuild_pending_ = false;
+
+    int64_t cooldown_until_ms_ = 0;
     bool warmed_up_regime_ = true;  // set
 };
 
