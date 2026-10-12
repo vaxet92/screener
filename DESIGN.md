@@ -1599,6 +1599,58 @@ at some point today."
   `FastTurnoverTracker` (`turnover.recent`/`turnover.prev`, `fast.LastClose()`). Only
   `liquidity`'s source moved.
 
+## 18. Re-activation cooldown — damping ACTIVE/INACTIVE flapping at the filter boundary
+
+A symbol whose conditions sit right at the filter boundary was flipping ACTIVE/INACTIVE on
+consecutive bars, spamming a Telegram notification per flip. The fix is a 1h cooldown after a
+filter-failure deactivation: the symbol cannot re-activate until the cooldown expires, even if
+every condition recovers on the very next bar.
+
+**What changed:**
+
+- `SymbolTracker` gains `cooldown_until_ms_` (`int64_t`, default `0`), with
+  `CooldownUntil()`/`SetCooldownUntil()`. `0` means "never deactivated by the filter — no
+  cooldown owed."
+- `CoreManager::TryDeactivate` sets `cooldown_until_ms_ = now_ms + kCooldownMs`
+  (`kCooldownMs = 3'600'000`, 1h) every time it deactivates an ACTIVE symbol.
+- `CoreManager::TryActivate` gates on it: `if (cooldown_until_ms_ != 0 && now_ms <
+  cooldown_until_ms_) return;` — strict `<`, so `now_ms == cooldown_until_ms_` activates.
+- `CoreManager::RequestRebuild`'s forced-INACTIVE path (a gap) does **not** set the cooldown.
+  A gap means "our data was wrong," not "the filter failed" — penalising it would delay
+  recovery for an incident that was the system's fault, not the market's. Confirmed by
+  `GapForcedDeactivationDoesNotSetCooldown` (`CooldownUntil()` stays `0` through a forced
+  deactivate).
+
+**Clock source — wall clock, not candle time, by deliberate choice:**
+
+`Evaluate()` is reachable from both `ApplyCandle` (1h close) and `ApplyFastCandle` (5m close),
+so a candle-derived "now" would need `max(last_ltf_open_time_ + kLtfMs, last_fast_open_time_ +
+kFastMs)` to stay correct regardless of which stream triggered the call — doable, but it
+reintroduces a two-stream dependency into a gate that is otherwise a pure time comparison.
+Instead:
+
+- `CoreManager::NowMs()` is a real `std::chrono::system_clock` read.
+- `ApplyCandle(const Candle& c, int64_t now_ms = NowMs())` and `ApplyFastCandle(...)` read it
+  **once per event**, at the call site (default-argument evaluation), and thread it down through
+  `Evaluate(s, now_ms)` → `TryActivate`/`TryDeactivate(s, now_ms, ...)` rather than re-reading a
+  clock in each function. `RequestFastRebuild(s, now_ms)` takes the same parameter so its
+  internal `Evaluate()` call sees the identical timestamp `ApplyFastCandle` read, not a second,
+  slightly later one.
+- **Known, accepted trade-off:** this is the one piece of system state that is NOT deterministic
+  across a replay — two replays of the same recorded session, run at different wall-clock times,
+  can cooldown-gate differently even though every indicator and transition up to that gate
+  reproduces bit-for-bit. `ReplayIsDeterministic` does not cover this gate for that reason.
+  Accepted because candle-derived time would need the two-stream `max()` above for no
+  correctness gain this system actually needs (DESIGN.md §1's honest framing: this screener
+  decides on an hourly close, cooldown precision below that is not load-bearing).
+- Tests pass `now_ms` explicitly (`ApplyCandle(c, fixed_ts)` / `ApplyFastCandle(c, fixed_ts)`)
+  to control the cooldown boundary deterministically — no clock-injection abstraction needed,
+  since the default argument is only evaluated when the caller omits it.
+
+**Tests** (`test_core.cpp`): `NeverDeactivatedHasNoCooldown`, `GapForcedDeactivationDoesNotSetCooldown`,
+`CooldownBlocksImmediateReactivation` (blocked at the same `now_ms` and again one ms before
+expiry), `ReactivatesOnceCooldownExpires` (pins the `now_ms == cooldown_until_ms_` boundary).
+
 **Tests:** `TurnoverMedianWindow` unit tests (readiness, which sorted index is "the median",
 sliding, the one-spike-bar case, reset) in `test_indicators.cpp`; `CoreManager` tests in
 `test_core.cpp` covering the default-off case, the boundary (`>=`), and the one-spike-hour

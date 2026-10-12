@@ -661,6 +661,107 @@ TEST(CoreManager, DeactivatesWhenAConditionStopsHolding) {
 }
 
 // ---------------------------------------------------------------------------
+// Cooldown - re-activation gate after a filter-failure deactivation
+// ---------------------------------------------------------------------------
+//
+// now_ms (the cooldown clock) and open_time_ms (bar identity/arrival
+// classification) are deliberately independent parameters here: a test can
+// hold now_ms fixed while advancing open_time_ms bar-by-bar, exactly the way
+// CoreManager itself treats them.
+
+// A bar that restores every condition DeactivatesWhenAConditionStopsHolding's
+// collapse broke (close back above EMA50, same turnover shape as the warm-up
+// fixture), so re-applying it is a clean "would otherwise reactivate" probe.
+Candle RecoveryFastBar(uint32_t symbol_id, int64_t open_time_ms) {
+    return FastBar(symbol_id, open_time_ms, 1000.0, 100.0);
+}
+
+TEST(CoreManager, NeverDeactivatedHasNoCooldown) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, TrendingHistory(0, 300, 100.0, 1.0));
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
+
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+    EXPECT_EQ(core.TrackerAt(0).CooldownUntil(), 0);
+}
+
+TEST(CoreManager, GapForcedDeactivationDoesNotSetCooldown) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    std::vector<Candle> history;
+    for (int i = 0; i < 300; ++i) {
+        history.push_back(Bar(0, static_cast<int64_t>(i) * kLtfMs, 100.0 + i, 1.0));
+    }
+    core.Warmup(0, history);
+    core.WarmupFast(0, FastHistory(0, 1000.0, 100.0, 1.0));
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+
+    // Gap on the LTF stream: RequestRebuild forces INACTIVE without going
+    // through TryDeactivate, so it must not touch the cooldown either - a
+    // gap is "our data was wrong", not a filter failure.
+    core.ApplyCandle(Bar(0, 310 * kLtfMs, 500.0, 500.0));
+
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+    EXPECT_EQ(core.TrackerAt(0).CooldownUntil(), 0);
+}
+
+TEST(CoreManager, CooldownBlocksImmediateReactivation) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, TrendingHistory(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+
+    constexpr int64_t kNow = 1'000'000'000'000;
+    int64_t next_open = static_cast<int64_t>(fast_history.size()) * kFastMs;
+
+    // Collapse: trend's price leg (fast stream) drops below EMA50.
+    core.ApplyFastCandle(FastBar(0, next_open, 1.0, 100.0), kNow);
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+    const int64_t cooldown_until = core.TrackerAt(0).CooldownUntil();
+    ASSERT_NE(cooldown_until, 0);
+    next_open += kFastMs;
+
+    // Every condition is restored, but wall time has not moved - must stay
+    // INACTIVE rather than flapping straight back.
+    core.ApplyFastCandle(RecoveryFastBar(0, next_open), kNow);
+    EXPECT_FALSE(core.TrackerAt(0).IsActive());
+    next_open += kFastMs;
+
+    // One ms before the cooldown expires: still blocked.
+    core.ApplyFastCandle(RecoveryFastBar(0, next_open), cooldown_until - 1);
+    EXPECT_FALSE(core.TrackerAt(0).IsActive());
+}
+
+TEST(CoreManager, ReactivatesOnceCooldownExpires) {
+    CoreManager core = MakeCore();
+    core.SetUniverse({"BTCUSDT"});
+
+    core.Warmup(0, TrendingHistory(0, 300, 100.0, 1.0));
+    const auto fast_history = FastHistory(0, 1000.0, 100.0, 1.0);
+    core.WarmupFast(0, fast_history);
+    ASSERT_TRUE(core.TrackerAt(0).IsActive());
+
+    constexpr int64_t kNow = 1'000'000'000'000;
+    int64_t next_open = static_cast<int64_t>(fast_history.size()) * kFastMs;
+
+    core.ApplyFastCandle(FastBar(0, next_open, 1.0, 100.0), kNow);
+    ASSERT_FALSE(core.TrackerAt(0).IsActive());
+    const int64_t cooldown_until = core.TrackerAt(0).CooldownUntil();
+    next_open += kFastMs;
+
+    // Exactly at the boundary (now_ms == cooldown_until_ms_) must activate -
+    // the guard is a strict `<`, not `<=`.
+    core.ApplyFastCandle(RecoveryFastBar(0, next_open), cooldown_until);
+    EXPECT_TRUE(core.TrackerAt(0).IsActive());
+}
+
+// ---------------------------------------------------------------------------
 // Transitions - TakeTransitions()
 // ---------------------------------------------------------------------------
 
